@@ -2216,6 +2216,24 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
     return pd.DataFrame(rows)
 
 
+def build_marshalling_queue_dataframe(appointment_df):
+    """Build the external marshalling-area backlog created by ELM appointment management.
+
+    This queue is outside JIP and therefore is not included in any physical
+    gate queue. It represents scheduled trucks that have not yet been released
+    into the port through the appointment cap.
+    """
+    if appointment_df is None or appointment_df.empty:
+        return pd.DataFrame()
+    df = appointment_df.copy()
+    required = {"hour", "scheduled_demand", "released_entries", "uncovered_end_of_hour"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+    return df[["hour", "scheduled_demand", "released_entries", "uncovered_end_of_hour"]].rename(
+        columns={"uncovered_end_of_hour": "marshalling_queue"}
+    )
+
+
 def build_junction_dataframe(junction_manager):
     return pd.DataFrame(junction_manager.activities)
 
@@ -3396,6 +3414,13 @@ def run_simulation(
         junctions_df = build_junction_dataframe(junction_manager)
 
         spillback_df = build_spillback_dataframe(graph, junctions_df, trucks_df)
+        marshalling_queue_df = build_marshalling_queue_dataframe(appointment_df)
+
+        # Appointment management is an external release mechanism. Trucks
+        # still waiting for an appointment remain in the external marshalling
+        # area and are never inserted into the JIP gate queues. Once released,
+        # they become normal port traffic and any resulting gate/network queue
+        # is physical and therefore modelled normally.
 
         if save_outputs:
             trucks_df.to_csv(TRUCK_OUTPUT, index=False)
@@ -3425,6 +3450,7 @@ def run_simulation(
             "junctions": junctions_df,
             "spillback": spillback_df,
             "appointment_profile": appointment_df,
+            "marshalling_queue": marshalling_queue_df,
             "graph": graph,
         }
     finally:
