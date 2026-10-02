@@ -539,11 +539,11 @@ flow_errors=[]
 fc1,fc2=st.columns(2)
 with fc1:
     st.subheader("Terminal split")
-    ts=st.data_editor(terminal_share_df(model.TERMINAL_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Share (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="terminal_share_editor")
+    ts=st.data_editor(terminal_share_df(model.TERMINAL_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Share (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="terminal_share_editor_v12")
     terminal_shares,err=df_to_terminal_shares(ts); flow_errors+=err
 with fc2:
     st.subheader("Full / Empty split")
-    cs=st.data_editor(cargo_share_df(model.CARGO_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Full (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1),"Empty (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="cargo_share_editor")
+    cs=st.data_editor(cargo_share_df(model.CARGO_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Full (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1),"Empty (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="cargo_share_editor_v12")
     cargo_shares,err=df_to_cargo_shares(cs); flow_errors+=err
 
 st.subheader("Gate allocation")
@@ -625,7 +625,7 @@ if result is None:
     st.info("Set the scenario parameters and click Run simulation.")
     st.stop()
 
-trucks=result["trucks"].copy(); gates=result["gates"].copy(); roads=result["roads"].copy(); road_hourly=result["road_hourly"].copy(); queues=result["queues"].copy(); queue_stock=result.get("queue_stock",queues).copy(); junction_results=result["junctions"].copy(); spillback=result.get("spillback",pd.DataFrame()).copy(); graph=result["graph"]; appointment=result.get("appointment_profile",pd.DataFrame())
+trucks=result["trucks"].copy(); gates=result["gates"].copy(); roads=result["roads"].copy(); road_hourly=result["road_hourly"].copy(); queues=result["queues"].copy(); queue_stock=result.get("queue_stock",queues).copy(); junction_results=result["junctions"].copy(); spillback=result.get("spillback",pd.DataFrame()).copy(); graph=result["graph"]; appointment=result.get("appointment_profile",pd.DataFrame()); marshalling_queue=result.get("marshalling_queue",pd.DataFrame()).copy()
 
 hour_q=queue_stock[queue_stock.hour==hour]
 queue_in={g:int(hour_q[(hour_q.gate==g)&(hour_q.operation=="ENTRY")].queue_stock.max()) if len(hour_q[(hour_q.gate==g)&(hour_q.operation=="ENTRY")]) else 0 for g in GATES}
@@ -643,7 +643,13 @@ for col,(label,value) in zip(c,kpi_values): col.metric(label,value)
 if management_enabled and not appointment.empty:
     st.subheader("Appointment management")
     st.dataframe(appointment,use_container_width=True)
-    st.caption("Uncovered demand is the demand that could not be released through the port-wide appointment cap and is carried into the next hour.")
+    st.caption("Unreleased demand is held in the external marshalling area. It is outside JIP and is therefore not counted in any physical gate queue. Only trucks released through the ELM cap can enter the port and contribute to gate, road and junction queues.")
+    if not marshalling_queue.empty:
+        st.subheader("External marshalling area")
+        mq=marshalling_queue.copy()
+        mq["hour_label"]=mq["hour"].astype(int).map(lambda h:f"{h:02d}:00")
+        st.line_chart(mq.set_index("hour_label")[["marshalling_queue"]])
+        st.caption("Marshalling queue = trucks waiting outside the port for appointment release. This is intentionally separate from the G1 entry queue.")
 
 st.subheader("Exit-gate spillback")
 if not spillback.empty:
@@ -727,8 +733,9 @@ if mc:
 
     metric_options = {
         "Peak gate queue": "peak_queue",
+        "Peak exit-gate spillback": "peak_spillback",
         "Peak network V/C": "peak_network_vc",
-        "Peak exit-gate spillback": "peak_spillback_trucks",
+        "Peak external marshalling queue": "peak_marshalling_queue",
         "Average turnaround proxy": "avg_turn_proxy_min",
     }
     selected_metric_label = st.selectbox(
@@ -744,16 +751,22 @@ if mc:
         x_label = f"Peak queue at {selected_gate} (trucks)"
         value_format = ".0f"
         suffix = " trucks"
+    elif selected_metric == "peak_spillback":
+        selected_gate = st.selectbox("Exit gate", [g for g in GATES if int(gate_lanes[g]["exit"]) > 0], index=0, key="mc_distribution_spillback_gate_v12")
+        value_col = f"peak_spillback_{selected_gate}"
+        x_label = f"Peak spillback attributable to {selected_gate} (trucks)"
+        value_format = ".0f"
+        suffix = " trucks"
     elif selected_metric == "peak_network_vc":
         selected_gate = None
         value_col = "peak_network_vc"
-        x_label = "Peak network V/C"
+        x_label = "Peak network V/C (worst link)"
         value_format = ".2f"
         suffix = ""
-    elif selected_metric == "peak_spillback_trucks":
+    elif selected_metric == "peak_marshalling_queue":
         selected_gate = None
-        value_col = "peak_spillback_trucks"
-        x_label = "Peak exit-gate spillback (trucks)"
+        value_col = "peak_marshalling_queue"
+        x_label = "Peak external marshalling queue (trucks)"
         value_format = ".0f"
         suffix = " trucks"
     else:
@@ -803,6 +816,7 @@ if mc:
 
         fig.update_layout(
             height=430,
+            title=dict(text=f"{selected_metric_label}{f" — {selected_gate}" if selected_gate else ""}", x=0.01, xanchor="left", font=dict(size=16)),
             margin=dict(l=20, r=20, t=25, b=20),
             paper_bgcolor="#12161c",
             plot_bgcolor="#12161c",
@@ -812,7 +826,8 @@ if mc:
             bargap=0.05,
             showlegend=False,
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "responsive": True, "scrollZoom": True})
+        st.caption("Use the Plotly controls to zoom, pan and inspect individual bins. The dashed lines show P10, P50, P90, P95 and P99.")
 
         pct_df = pd.DataFrame({"Percentile": list(percentiles.keys()), "Value": list(percentiles.values())})
         c1, c2, c3, c4, c5 = st.columns(5)
