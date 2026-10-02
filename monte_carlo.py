@@ -265,10 +265,16 @@ def run_monte_carlo(
             link_peak = np.zeros(len(link_names), dtype=float)
             weighted_wait = 0.0
             peak_spillback = 0.0
+            peak_spillback_by_gate = {g: 0.0 for g in exit_gates}
+            peak_marshalling_queue = 0.0
             total_released = int(released.sum())
 
             for h in range(len(released)):
                 n = int(released[h])
+                if management_enabled:
+                    scheduled_to_date = int(desired[:min(h + 1, len(desired))].sum())
+                    released_to_date = int(released[:h + 1].sum())
+                    peak_marshalling_queue = max(peak_marshalling_queue, float(scheduled_to_date - released_to_date))
                 if n == 0:
                     continue
                 counts = rng.multinomial(n, option_probs)
@@ -310,6 +316,7 @@ def run_monte_carlo(
                         storage = max(1.0, float(graph[link_names[idx][0]][link_names[idx][1]].get("capacity_vph", 0.0)) * float(graph[link_names[idx][0]][link_names[idx][1]].get("travel_time_min", 0.0)) / 60.0)
                         excess = max(0.0, q - storage)
                         peak_spillback = max(peak_spillback, excess)
+                        peak_spillback_by_gate[gate] = max(peak_spillback_by_gate.get(gate, 0.0), excess)
                         if excess > 0:
                             link_peak[idx] = max(link_peak[idx], 1.0 + excess / storage)
                 weighted_wait += float(gate_q_in.sum() + gate_q_out.sum())
@@ -334,14 +341,16 @@ def run_monte_carlo(
                 "peak_network_vc": peak_network_vc,
                 "peak_network_link": peak_link,
                 "peak_spillback_trucks": float(peak_spillback),
+                "peak_marshalling_queue": float(peak_marshalling_queue),
                 "avg_turn_proxy_min": terminal_time + gate_wait_proxy,
             }
             for g in gate_lanes:
                 row[f"peak_queue_{g}"] = peak_gate.get(g, 0.0)
+                row[f"peak_spillback_{g}"] = peak_spillback_by_gate.get(g, 0.0)
             records.append(row)
 
         df = pd.DataFrame(records)
-        metric_cols = ["peak_queue_all", "peak_network_vc", "peak_spillback_trucks", "avg_turn_proxy_min"] + [f"peak_queue_{g}" for g in gate_lanes]
+        metric_cols = ["peak_queue_all", "peak_network_vc", "peak_spillback_trucks", "peak_marshalling_queue", "avg_turn_proxy_min"] + [f"peak_queue_{g}" for g in gate_lanes] + [f"peak_spillback_{g}" for g in exit_gates]
         metrics = {}
         for col in metric_cols:
             metrics[col] = {p: float(df[col].quantile(float(p[1:]) / 100.0)) for p in ["P10", "P50", "P90", "P95", "P99"]}
