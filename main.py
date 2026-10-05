@@ -2237,6 +2237,7 @@ def build_marshalling_queue_dataframe(appointment_df):
 def build_junction_dataframe(junction_manager):
     return pd.DataFrame(junction_manager.activities)
 
+
 def junction_congestion_status(vc):
     """Classify junction pressure from peak hourly V/C."""
     vc = float(vc)
@@ -2250,13 +2251,62 @@ def junction_congestion_status(vc):
 
 
 def build_junction_summary(junctions_df):
-    """Build a node-level congestion summary for the three key junctions."""
+    """Build a node-level congestion summary for the three key junctions.
 
+    N1/N2/N3 are treated as node bottlenecks. Peak V/C is calculated as
+    the maximum hourly number of simulated movements through the node divided
+    by the configured effective junction capacity. Queueing/delay remains a
+    separate output, so a node can show delay caused by downstream spillback
+    even when its own peak V/C is below 1.0.
+    """
     target_nodes = ["N01", "N02", "N03"]
     rows = []
 
     if junctions_df is None:
         junctions_df = pd.DataFrame()
+
+    df = junctions_df.copy()
+    if not df.empty:
+        if "requested_min" in df.columns:
+            df["hour"] = (pd.to_numeric(df["requested_min"], errors="coerce") // 60).astype("Int64")
+        else:
+            df["hour"] = pd.Series(dtype="Int64")
+
+    for node in target_nodes:
+        cfg = JUNCTIONS.get(node, {})
+        capacity = float(cfg.get("capacity_vph", 0.0))
+        nd = df[df.get("junction", pd.Series(dtype=str)) == node] if not df.empty else pd.DataFrame()
+
+        if not nd.empty and "hour" in nd.columns:
+            hourly = nd.groupby("hour").size()
+            peak_flow = int(hourly.max()) if len(hourly) else 0
+            peak_hour = int(hourly.idxmax()) if len(hourly) else None
+        else:
+            peak_flow = 0
+            peak_hour = None
+
+        peak_vc = peak_flow / capacity if capacity > 0 else 0.0
+        avg_wait = float(nd["wait_min"].mean()) if not nd.empty and "wait_min" in nd.columns else 0.0
+        peak_wait = float(nd["wait_min"].max()) if not nd.empty and "wait_min" in nd.columns else 0.0
+        avg_spill = float(nd["spillback_wait_min"].mean()) if not nd.empty and "spillback_wait_min" in nd.columns else 0.0
+        peak_spill = float(nd["spillback_wait_min"].max()) if not nd.empty and "spillback_wait_min" in nd.columns else 0.0
+
+        rows.append({
+            "junction": node,
+            "movements": int(len(nd)),
+            "peak_hour": peak_hour,
+            "peak_hourly_flow": peak_flow,
+            "capacity_vph": capacity,
+            "peak_vc": peak_vc,
+            "utilization_pct": peak_vc * 100.0,
+            "avg_wait_min": avg_wait,
+            "peak_wait_min": peak_wait,
+            "avg_spillback_wait_min": avg_spill,
+            "peak_spillback_wait_min": peak_spill,
+            "congestion": junction_congestion_status(peak_vc),
+        })
+
+    return pd.DataFrame(rows)
 
 
 def build_road_hourly_dataframe(road_manager):
@@ -3196,6 +3246,214 @@ def print_summary(
 # 18. MAIN
 # ============================================================
 
+def run_simulation(
+    trucks_per_day=None,
+    route_randomization=None,
+    seed=None,
+    entry_gate_rules=None,
+    exit_gate_rules=None,
+    entry_access_rules=None,
+    gate_lanes=None,
+    average_speed_kmh=None,
+    lanes_per_direction=None,
+    capacity_per_lane_vph=None,
+    arrival_time_variability=None,
+    junctions=None,
+    appointment_management_enabled=None,
+    max_entries_per_hour=None,
+    route_overrides=None,
+    logistics_destination_daily=None,
+    gate_times_sec=None,
+    n2_n1_corridor_lanes=None,
+    terminal_shares=None,
+    cargo_shares=None,
+    save_outputs=True,
+):
+    global TRUCK_MOVEMENTS_PER_DAY, INTERNAL_MOVEMENTS_PER_DAY, ROUTE_RANDOMIZATION, RANDOM_SEED
+    global ENTRY_GATE_RULES, EXIT_GATE_RULES, ENTRY_ACCESS_RULES
+    global GATE_LANES, AVERAGE_SPEED_KMH, GATE_TIMES_SEC, N2_N1_CORRIDOR_LANES
+    global LANES_PER_DIRECTION, CAPACITY_PER_LANE_VPH, ROAD_CAPACITY_VPH, JUNCTIONS
+    global APPOINTMENT_MANAGEMENT_ENABLED, MAX_PORT_ENTRIES_PER_HOUR, ROUTE_OVERRIDES
+    global TERMINAL_SHARES, CARGO_SHARES
+    global LOGISTICS_DESTINATION_DAILY
+
+    original = (
+        TRUCK_MOVEMENTS_PER_DAY,
+        INTERNAL_MOVEMENTS_PER_DAY,
+        ROUTE_RANDOMIZATION,
+        RANDOM_SEED,
+        ENTRY_GATE_RULES,
+        EXIT_GATE_RULES,
+        ENTRY_ACCESS_RULES,
+        GATE_LANES,
+        AVERAGE_SPEED_KMH,
+        LANES_PER_DIRECTION,
+        CAPACITY_PER_LANE_VPH,
+        ROAD_CAPACITY_VPH,
+        JUNCTIONS,
+        APPOINTMENT_MANAGEMENT_ENABLED,
+        MAX_PORT_ENTRIES_PER_HOUR,
+        ROUTE_OVERRIDES,
+        LOGISTICS_DESTINATION_DAILY.copy(),
+        dict(GATE_TIMES_SEC),
+        N2_N1_CORRIDOR_LANES,
+        dict(TERMINAL_SHARES),
+        {k:dict(v) for k,v in CARGO_SHARES.items()},
+    )
+
+    if trucks_per_day is not None:
+        TRUCK_MOVEMENTS_PER_DAY = int(trucks_per_day)
+    INTERNAL_MOVEMENTS_PER_DAY = int(round(TRUCK_MOVEMENTS_PER_DAY * INTERNAL_MOVEMENTS_SHARE))
+    if route_randomization is not None:
+        ROUTE_RANDOMIZATION = float(route_randomization)
+    if seed is not None:
+        RANDOM_SEED = int(seed)
+    if arrival_time_variability is None:
+        arrival_time_variability = ARRIVAL_TIME_RANDOMIZATION
+    else:
+        arrival_time_variability = float(arrival_time_variability)
+    if not 0 <= arrival_time_variability <= 1:
+        raise ValueError(
+            "arrival_time_variability must be between 0 and 1."
+        )
+    if entry_gate_rules is not None:
+        ENTRY_GATE_RULES = entry_gate_rules
+    if exit_gate_rules is not None:
+        EXIT_GATE_RULES = exit_gate_rules
+    if entry_access_rules is not None:
+        ENTRY_ACCESS_RULES = {k:list(v) for k,v in entry_access_rules.items()}
+    if gate_lanes is not None:
+        GATE_LANES = dict(gate_lanes)
+    if average_speed_kmh is not None:
+        AVERAGE_SPEED_KMH = float(average_speed_kmh)
+    if lanes_per_direction is not None:
+        LANES_PER_DIRECTION = int(lanes_per_direction)
+    if capacity_per_lane_vph is not None:
+        CAPACITY_PER_LANE_VPH = float(capacity_per_lane_vph)
+    ROAD_CAPACITY_VPH = LANES_PER_DIRECTION * CAPACITY_PER_LANE_VPH
+    if junctions is not None:
+        JUNCTIONS = {k: dict(v) for k, v in junctions.items()}
+    if appointment_management_enabled is not None:
+        APPOINTMENT_MANAGEMENT_ENABLED = bool(appointment_management_enabled)
+    if max_entries_per_hour is not None:
+        MAX_PORT_ENTRIES_PER_HOUR = int(max_entries_per_hour)
+    if logistics_destination_daily is not None:
+        LOGISTICS_DESTINATION_DAILY={str(k):int(v) for k,v in logistics_destination_daily.items()}
+    if route_overrides is not None:
+        ROUTE_OVERRIDES = {tuple(k): list(v) for k, v in route_overrides.items()}
+    if gate_times_sec is not None:
+        GATE_TIMES_SEC = {k: float(v) for k, v in gate_times_sec.items()}
+    if n2_n1_corridor_lanes is not None:
+        N2_N1_CORRIDOR_LANES = int(n2_n1_corridor_lanes)
+    if terminal_shares is not None:
+        TERMINAL_SHARES = {str(k): float(v) for k, v in terminal_shares.items()}
+    if cargo_shares is not None:
+        CARGO_SHARES = {str(k): {str(c): float(v) for c, v in shares.items()} for k, shares in cargo_shares.items()}
+
+    try:
+        validate_configuration()
+
+        print("\nReading KML network...")
+        routes = read_kml_routes()
+        print(f"Routes read: {len(routes)}")
+        for route in routes:
+            print(
+                f"  {route['name']} | "
+                f"{route['distance_km']:.3f} km | "
+                f"{route['travel_time_min']:.2f} min"
+            )
+
+        graph = build_network(routes)
+        route_errors = validate_route_overrides(graph, ROUTE_OVERRIDES)
+        if route_errors:
+            raise ValueError("\nInvalid route overrides:\n" + "\n".join(f"  - {e}" for e in route_errors))
+        print(f"\nNetwork nodes: {graph.number_of_nodes()}")
+        print(f"Directed links: {graph.number_of_edges()}")
+
+        required_nodes = {
+            "G1", "G2", "G4", "G6", "G8", "G9",
+            "N01", "N02", "N04", "N05", "N06", "N07", "N08", "N09", "N10",
+            "DPW", "RSGT", "MPT1", "MPT2", "MPT3",
+            "Logipoint", "CMA CGM", "Bahri Logistics",
+        }
+        missing_nodes = required_nodes - set(graph.nodes)
+        if missing_nodes:
+            raise RuntimeError(
+                "\nThe following required nodes are missing from the KML:\n"
+                + str(sorted(missing_nodes))
+            )
+
+        # ------------------------------------------------------------
+        # NETWORK CONNECTIVITY CHECK
+        # ------------------------------------------------------------
+        routing_pairs = set()
+
+        for (terminal, cargo), options in ENTRY_ACCESS_RULES.items():
+            destinations = (
+                list(MPT_DESTINATION_SPLIT.keys()) if terminal == "MPT"
+                else list(LOGISTICS_DESTINATION_DAILY.keys()) if terminal == "LOGISTICS"
+                else [get_destination_node(terminal)]
+            )
+            for destination_raw in destinations:
+                destination = get_destination_node(
+                    terminal,
+                    destination_raw if terminal == "MPT" else None,
+                )
+                for gate, share in options:
+                    if float(share) > 0:
+                        routing_pairs.add((gate, destination))
+
+        for (terminal, cargo), options in EXIT_GATE_RULES.items():
+            destinations = (
+                list(MPT_DESTINATION_SPLIT.keys()) if terminal == "MPT"
+                else list(LOGISTICS_DESTINATION_DAILY.keys()) if terminal == "LOGISTICS"
+                else [get_destination_node(terminal)]
+            )
+            for destination_raw in destinations:
+                destination = get_destination_node(
+                    terminal,
+                    destination_raw if terminal == "MPT" else None,
+                )
+                for gate, share in options:
+                    if float(share) > 0:
+                        routing_pairs.add((destination, gate))
+
+        connectivity_errors = []
+        for start, destination in sorted(routing_pairs):
+            if start not in graph or destination not in graph:
+                connectivity_errors.append(
+                    f"{start} -> {destination}: missing node"
+                )
+            elif not nx.has_path(graph, start, destination):
+                connectivity_errors.append(
+                    f"{start} -> {destination}: no route"
+                )
+
+        if connectivity_errors:
+            raise RuntimeError(
+                "\nNETWORK CONNECTIVITY CHECK FAILED:\n"
+                + "\n".join(f"  - {x}" for x in connectivity_errors)
+            )
+
+        print("\nNETWORK CONNECTIVITY CHECK: OK")
+
+        print("\nGenerating truck demand...")
+        trucks, appointment_df = create_trucks(
+            arrival_time_variability=arrival_time_variability,
+            appointment_management_enabled=APPOINTMENT_MANAGEMENT_ENABLED,
+            max_entries_per_hour=MAX_PORT_ENTRIES_PER_HOUR,
+            logistics_destination_daily=LOGISTICS_DESTINATION_DAILY,
+        )
+        print(f"Trucks generated: {len(trucks):,}")
+
+        env = simpy.Environment()
+        road_manager = RoadManager(env, graph)
+        gate_manager = GateManager(env)
+        junction_manager = JunctionManager(env)
+        route_rng = random.Random(RANDOM_SEED + 100003)
+
+        env.process(gate_manager.monitor_queues())
+
         for truck in trucks:
             env.process(
                 simulate_truck(
@@ -3268,7 +3526,7 @@ def print_summary(
             "marshalling_queue": marshalling_queue_df,
             "graph": graph,
         }
-        finally:
+    finally:
         (
             TRUCK_MOVEMENTS_PER_DAY,
             INTERNAL_MOVEMENTS_PER_DAY,
