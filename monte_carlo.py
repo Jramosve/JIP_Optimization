@@ -42,14 +42,16 @@ PERCENTILES = {
 
 QUEUE_SNAPSHOT_INTERVAL_MIN = 5.0
 
-# Exact base hourly profile used by main.py.
-BASE_HOURLY_SHARES = np.array([
-    0.035, 0.030, 0.021, 0.015, 0.018, 0.019,
-    0.036, 0.036, 0.043, 0.048, 0.048, 0.051,
-    0.050, 0.048, 0.055, 0.056, 0.053, 0.056,
-    0.048, 0.046, 0.047, 0.051, 0.048, 0.042,
-], dtype=float)
-BASE_HOURLY_SHARES /= BASE_HOURLY_SHARES.sum()
+
+
+def hourly_profile(model):
+    """
+    The observed 24-hour shares used by main.py, read from main.py itself
+    so the two models can never use different profiles.
+    """
+    minute_profile = np.asarray(model.create_base_hourly_profile(), dtype=float)
+    hourly = minute_profile.reshape(24, -1).sum(axis=1)
+    return hourly / hourly.sum()
 
 # Upper bound on batch_size * trucks_per_day. Small batches keep the
 # working arrays in cache, which is faster than one large batch.
@@ -206,7 +208,7 @@ def _spread_within_hours(rng, counts, jitter_scale):
     return times
 
 
-def _arrival_times(rng, batch, trucks, variability, cap):
+def _arrival_times(rng, batch, trucks, variability, cap, base_shares):
     """
     Reproduce main.generate_arrival_times and
     main.apply_entry_appointment_cap.
@@ -216,7 +218,7 @@ def _arrival_times(rng, batch, trucks, variability, cap):
     an appointment cap both are the same array. FIFO release means the
     i-th scheduled truck is the i-th released truck.
     """
-    hourly = np.broadcast_to(BASE_HOURLY_SHARES, (batch, 24)).copy()
+    hourly = np.broadcast_to(base_shares, (batch, 24)).copy()
     if variability > 0:
         hourly *= np.exp(rng.normal(0.0, variability * 0.12, (batch, 24)))
         hourly /= hourly.sum(axis=1, keepdims=True)
@@ -414,6 +416,7 @@ def _simulate_batch(cfg, rng, batch):
         trucks,
         cfg["arrival_variability"],
         cfg["max_entries_per_hour"] if cfg["management_enabled"] else None,
+        cfg["hourly_shares"],
     )
 
     rows = np.arange(batch)[:, None]
@@ -786,6 +789,7 @@ def run_monte_carlo(
         "max_entries_per_hour": max_entries_per_hour,
         "terminals": terminals,
         "gates": gates,
+        "hourly_shares": hourly_profile(model),
         "terminal_shares": [float(terminal_shares[t]) for t in terminals],
         "cargo_shares": [
             [float(cargo_shares[t]["FULL"]), float(cargo_shares[t]["EMPTY"])]

@@ -205,3 +205,18 @@ def test_route_randomization_matches_main_choice_rule():
     # main.choose_network_path: shortest with prob 1 - r; otherwise weighted
     # by max(0.05, min_cost / cost) = [1, 0.5].
     assert probs == pytest.approx([0.5 + 0.5 * 2 / 3, 0.5 * 1 / 3])
+
+
+def test_monte_carlo_uses_main_hourly_profile():
+    minute = model.create_base_hourly_profile()
+    expected = minute.reshape(24, -1).sum(axis=1)
+    assert mcm.hourly_profile(model) == pytest.approx(expected / expected.sum())
+
+
+def test_exit_flow_to_gate_without_exit_lanes_is_rejected():
+    rules = {k: list(v) for k, v in model.EXIT_GATE_RULES.items()}
+    rules[("DPW", "FULL")] = [("G4", 1.0)]  # G4 has 0 exit lanes
+    with pytest.raises(ValueError, match="G4 has 0 exit lanes"):
+        run_main(exit_gate_rules=rules)
+    with pytest.raises(ValueError, match="no lanes"):
+        mcm.run_monte_carlo(model, 10, exit_gate_rules=rules)
