@@ -2186,7 +2186,7 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
         requested = int((g["requested_min"] <= t).sum()) if not g.empty else 0
         finished = int((g["finish_min"] <= t).sum()) if not g.empty else 0
         in_service = int(
-            ((g["requested_min"] <= t) & (g["finish_min"] > t)).sum()
+            ((g["start_min"] <= t) & (g["finish_min"] > t)).sum()
         ) if not g.empty else 0
 
         if operation == "EXIT" and gate in exit_queue_lookup:
