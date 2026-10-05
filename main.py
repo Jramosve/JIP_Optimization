@@ -2237,6 +2237,27 @@ def build_marshalling_queue_dataframe(appointment_df):
 def build_junction_dataframe(junction_manager):
     return pd.DataFrame(junction_manager.activities)
 
+def junction_congestion_status(vc):
+    """Classify junction pressure from peak hourly V/C."""
+    vc = float(vc)
+    if vc < 0.70:
+        return "Low"
+    if vc < 0.85:
+        return "Moderate"
+    if vc <= 1.00:
+        return "High"
+    return "Congested"
+
+
+def build_junction_summary(junctions_df):
+    """Build a node-level congestion summary for the three key junctions."""
+
+    target_nodes = ["N01", "N02", "N03"]
+    rows = []
+
+    if junctions_df is None:
+        junctions_df = pd.DataFrame()
+
 
 def build_road_hourly_dataframe(road_manager):
     df = pd.DataFrame(road_manager.traversals)
