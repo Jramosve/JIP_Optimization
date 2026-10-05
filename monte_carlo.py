@@ -117,31 +117,12 @@ def _load_graph(model):
     return _GRAPH_CACHE[key]
 
 
-def _route_time_min(
-    model,
-    graph,
-    start,
-    end,
-    speed_kmh,
-    junctions,
-    route_overrides,
-):
+def _path_time_min(graph, path, speed_kmh, junctions):
     """
     Uncongested route time used by main.simulate_truck: link travel at
     the average speed plus junction service (60 / capacity) and
     manoeuvre delay at every intermediate junction.
     """
-    path = None
-    if route_overrides:
-        path = route_overrides.get((start, end))
-    if not path:
-        path = nx.shortest_path(
-            graph,
-            start,
-            end,
-            weight="travel_time_min",
-        )
-
     minutes = 0.0
     for i, (a, b) in enumerate(zip(path[:-1], path[1:])):
         data = graph[a][b]
@@ -156,39 +137,59 @@ def _route_time_min(
     return minutes
 
 
+def _route_options(
+    model,
+    graph,
+    start,
+    end,
+    speed_kmh,
+    junctions,
+    route_overrides,
+    route_randomization,
+):
+    """
+    Route times and probabilities, as main.choose_network_path picks them:
+    an override if configured; otherwise the shortest path, or with
+    probability `route_randomization` one of the k shortest paths weighted
+    by max(0.05, min_cost / cost).
+    """
+    if route_overrides and route_overrides.get((start, end)):
+        paths = [list(route_overrides[(start, end)])]
+    else:
+        k = max(1, int(getattr(model, "ROUTE_ALTERNATIVE_COUNT", 1)))
+        paths = []
+        for path in nx.shortest_simple_paths(
+            graph, start, end, weight="travel_time_min"
+        ):
+            paths.append(path)
+            if len(paths) >= k:
+                break
+
+    times = [_path_time_min(graph, p, speed_kmh, junctions) for p in paths]
+    probs = np.zeros(len(paths))
+    probs[0] = 1.0
+    if len(paths) > 1 and route_randomization > 0:
+        costs = np.array([
+            sum(graph[a][b]["travel_time_min"] for a, b in zip(p[:-1], p[1:]))
+            for p in paths
+        ])
+        weights = np.maximum(0.05, costs.min() / costs)
+        probs = (1.0 - route_randomization) * probs
+        probs += route_randomization * weights / weights.sum()
+    return times, probs
+
+
 # ============================================================
 # Demand generation (vectorised over scenarios)
 # ============================================================
 
-def _arrival_times(rng, batch, trucks, variability, cap):
+def _spread_within_hours(rng, counts, jitter_scale):
     """
-    (batch, trucks) sorted arrival times, reproducing
-    main.generate_arrival_times and main.apply_entry_appointment_cap.
+    Place counts[s, h] trucks uniformly through each hour h, with the
+    same within-hour jitter as main.generate_arrival_times.
+    Returns sorted (batch, total) times.
     """
-    hourly = np.broadcast_to(BASE_HOURLY_SHARES, (batch, 24)).copy()
-    if variability > 0:
-        hourly *= np.exp(rng.normal(0.0, variability * 0.12, (batch, 24)))
-        hourly /= hourly.sum(axis=1, keepdims=True)
-    counts = _largest_remainder(trucks, hourly)
-
-    if cap is not None:
-        # FIFO backlog: released appointments are spaced uniformly
-        # through each hour, and can run past 24:00.
-        released = []
-        backlog = np.zeros(batch, dtype=np.int64)
-        hour = 0
-        while hour < 24 or backlog.any():
-            demand = backlog + (counts[:, hour] if hour < 24 else 0)
-            release = np.minimum(demand, cap)
-            released.append(release)
-            backlog = demand - release
-            hour += 1
-        counts = np.stack(released, axis=1)
-        jitter_scale = 0.0
-    else:
-        jitter_scale = 0.25
-
-    hours = counts.shape[1]
+    batch, hours = counts.shape
     flat_counts = counts.ravel()
     hour_of = np.repeat(np.tile(np.arange(hours), batch), flat_counts)
     count_of = np.repeat(flat_counts, flat_counts)
@@ -199,10 +200,56 @@ def _arrival_times(rng, batch, trucks, variability, cap):
     if jitter_scale:
         frac += rng.uniform(-jitter_scale, jitter_scale, frac.shape) / count_of
     minute = np.clip(frac * 60.0, 0.0, 59.999)
-    times = (hour_of * 60.0 + minute).reshape(batch, trucks)
+    times = (hour_of * 60.0 + minute).reshape(batch, -1)
     # Already sorted except, at most, for clipped boundary values.
     times.sort(axis=1)
     return times
+
+
+def _arrival_times(rng, batch, trucks, variability, cap):
+    """
+    Reproduce main.generate_arrival_times and
+    main.apply_entry_appointment_cap.
+
+    Returns (released, scheduled): (batch, trucks) sorted times at which
+    each truck enters the port and at which it wanted to enter. Without
+    an appointment cap both are the same array. FIFO release means the
+    i-th scheduled truck is the i-th released truck.
+    """
+    hourly = np.broadcast_to(BASE_HOURLY_SHARES, (batch, 24)).copy()
+    if variability > 0:
+        hourly *= np.exp(rng.normal(0.0, variability * 0.12, (batch, 24)))
+        hourly /= hourly.sum(axis=1, keepdims=True)
+    counts = _largest_remainder(trucks, hourly)
+    scheduled = _spread_within_hours(rng, counts, 0.25)
+
+    if cap is None:
+        return scheduled, scheduled
+
+    # FIFO backlog: released appointments are spaced uniformly through
+    # each hour, and can run past 24:00.
+    released = []
+    backlog = np.zeros(batch, dtype=np.int64)
+    hour = 0
+    while hour < 24 or backlog.any():
+        demand = backlog + (counts[:, hour] if hour < 24 else 0)
+        release = np.minimum(demand, cap)
+        released.append(release)
+        backlog = demand - release
+        hour += 1
+    return _spread_within_hours(rng, np.stack(released, axis=1), 0.0), scheduled
+
+
+def marshalling_profile(scheduled, released, times):
+    """
+    Trucks waiting in the external marshalling area at each time:
+    scheduled to enter by t but not yet released by the ELM cap.
+    Works on 1-D sorted arrays.
+    """
+    return (
+        np.searchsorted(scheduled, times, side="right")
+        - np.searchsorted(released, times, side="right")
+    )
 
 
 def _terminal_assignments(rng, batch, trucks, terminal_shares):
@@ -361,7 +408,7 @@ def _simulate_batch(cfg, rng, batch):
 
     # ---- Demand ----------------------------------------------
     terminal = _terminal_assignments(rng, batch, trucks, terminal_shares)
-    arrival = _arrival_times(
+    arrival, scheduled = _arrival_times(
         rng,
         batch,
         trucks,
@@ -400,11 +447,20 @@ def _simulate_batch(cfg, rng, batch):
     )
 
     # ---- Truck cycle to the exit gate ------------------------
+    n_gates, n_nodes = len(cfg["gates"]), cfg["entry_route_min"].shape[1]
+    entry_path = _categorical(
+        rng.random((batch, trucks)), cfg["entry_route_cum"],
+        entry_gate * n_nodes + dest_node,
+    )
+    exit_path = _categorical(
+        rng.random((batch, trucks)), cfg["exit_route_cum"],
+        dest_node * n_gates + exit_gate,
+    )
     exit_arrival = (
         entry_finish
-        + cfg["entry_route_min"][entry_gate, dest_node]
+        + cfg["entry_route_min"][entry_gate, dest_node, entry_path]
         + cfg["terminal_min"][terminal, cargo]
-        + cfg["exit_route_min"][dest_node, exit_gate]
+        + cfg["exit_route_min"][dest_node, exit_gate, exit_path]
     )
     exit_service = cfg["service_min"][1][cargo]
     _, exit_kpis = _gate_stage(
@@ -416,7 +472,22 @@ def _simulate_batch(cfg, rng, batch):
         cfg["snapshot_times"],
     )
 
-    return entry_kpis, exit_kpis
+    # ---- External marshalling area (ELM backlog) --------------
+    marshalling_wait = np.maximum(arrival - scheduled, 0.0)
+    horizon = np.arange(0.0, float(arrival.max()) + 60.0, QUEUE_SNAPSHOT_INTERVAL_MIN)
+    marshalling_peak = np.array([
+        marshalling_profile(scheduled[s], arrival[s], horizon).max()
+        for s in range(batch)
+    ])
+    marshalling = {
+        "peak_marshalling_queue": marshalling_peak,
+        "avg_marshalling_wait": marshalling_wait.mean(axis=1),
+        "peak_marshalling_wait": marshalling_wait.max(axis=1),
+        "marshalling_truck_hours": marshalling_wait.sum(axis=1) / 60.0,
+        "last_entry_hour": arrival[:, -1] / 60.0,
+    }
+
+    return entry_kpis, exit_kpis, marshalling
 
 
 # ============================================================
@@ -436,7 +507,7 @@ def _percentile_summary(df, columns):
     return metrics
 
 
-def _batch_rows(cfg, entry_kpis, exit_kpis, batch, first_sim, seed):
+def _batch_rows(cfg, entry_kpis, exit_kpis, marshalling, batch, first_sim, seed):
     gates = cfg["gates"]
     zeros = np.zeros(batch)
     data = {
@@ -495,6 +566,7 @@ def _batch_rows(cfg, entry_kpis, exit_kpis, batch, first_sim, seed):
     data["peak_queue_hour"] = (
         cfg["snapshot_times"][profile_all.argmax(axis=1)] // 60
     ).astype(int)
+    data.update(marshalling)
     return pd.DataFrame(data)
 
 
@@ -577,6 +649,11 @@ def run_monte_carlo(
         terminal_process_min = model.TERMINAL_PROCESS_MIN
     if route_overrides is None:
         route_overrides = model.ROUTE_OVERRIDES
+    if route_randomization is None:
+        route_randomization = model.ROUTE_RANDOMIZATION
+    route_randomization = float(route_randomization)
+    if not 0 <= route_randomization <= 1:
+        raise ValueError("route_randomization must be between 0 and 1.")
     if graph is None:
         graph = _load_graph(model)
 
@@ -639,9 +716,14 @@ def run_monte_carlo(
         dest_node[t, :len(names)] = [node_index[n] for n in names]
         dest_node[t, len(names):] = node_index[names[-1]]
 
-    # Route times for every (gate, node) pair that can be used.
-    entry_route = np.full((len(gates), len(nodes)), np.nan)
-    exit_route = np.full((len(nodes), len(gates)), np.nan)
+    # Route-time options for every (gate, node) pair that can be used:
+    # [..., k] = time of the k-th candidate path and cumulative probability.
+    max_k = max(1, int(getattr(model, "ROUTE_ALTERNATIVE_COUNT", 1)))
+    entry_route = np.zeros((len(gates), len(nodes), max_k))
+    exit_route = np.zeros((len(nodes), len(gates), max_k))
+    entry_route_cum = np.ones((len(gates), len(nodes), max_k))
+    exit_route_cum = np.ones((len(nodes), len(gates), max_k))
+    done = set()
     overrides = {tuple(k): list(v) for k, v in (route_overrides or {}).items()}
     for t, terminal in enumerate(terminals):
         names = per_terminal[t][0]
@@ -654,22 +736,26 @@ def run_monte_carlo(
                     if float(share) <= 0:
                         continue
                     for name in names:
-                        g, n = gate_index[gate], node_index[name]
                         start, end = (gate, name) if is_entry else (name, gate)
-                        target = entry_route if is_entry else exit_route
+                        if (start, end) in done:
+                            continue
+                        done.add((start, end))
+                        try:
+                            times, probs = _route_options(
+                                model, graph, start, end, average_speed_kmh,
+                                junctions, overrides, route_randomization,
+                            )
+                        except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
+                            raise RuntimeError(
+                                f"No route from {start} to {end}."
+                            ) from exc
+                        g, n = gate_index[gate], node_index[name]
                         cell = (g, n) if is_entry else (n, g)
-                        if np.isnan(target[cell]):
-                            try:
-                                target[cell] = _route_time_min(
-                                    model, graph, start, end,
-                                    average_speed_kmh, junctions, overrides,
-                                )
-                            except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
-                                raise RuntimeError(
-                                    f"No route from {start} to {end}."
-                                ) from exc
-    entry_route = np.nan_to_num(entry_route)
-    exit_route = np.nan_to_num(exit_route)
+                        table = entry_route if is_entry else exit_route
+                        cum = entry_route_cum if is_entry else exit_route_cum
+                        table[cell][:len(times)] = times
+                        table[cell][len(times):] = times[-1]
+                        cum[cell][:len(probs)] = np.cumsum(probs)
 
     crossing = getattr(model, "INTERNAL_GATE_CROSSING_SEC", {})
     terminal_min = np.array([
@@ -711,6 +797,8 @@ def run_monte_carlo(
         "dest_node": dest_node,
         "entry_route_min": entry_route,
         "exit_route_min": exit_route,
+        "entry_route_cum": entry_route_cum.reshape(-1, max_k),
+        "exit_route_cum": exit_route_cum.reshape(-1, max_k),
         "terminal_min": terminal_min,
         "service_min": service_min,
         "entry_lanes": {
@@ -737,9 +825,9 @@ def run_monte_carlo(
     done = 0
     while done < simulations:
         batch = min(batch_size, simulations - done)
-        entry_kpis, exit_kpis = _simulate_batch(cfg, rng, batch)
+        entry_kpis, exit_kpis, marshalling = _simulate_batch(cfg, rng, batch)
         frames.append(
-            _batch_rows(cfg, entry_kpis, exit_kpis, batch, done + 1, seed)
+            _batch_rows(cfg, entry_kpis, exit_kpis, marshalling, batch, done + 1, seed)
         )
         done += batch
         if progress_callback is not None:
@@ -749,7 +837,11 @@ def run_monte_carlo(
 
     metric_columns = [
         c for c in df.columns
-        if c.startswith(("peak_queue_", "avg_wait_", "peak_wait_"))
+        if c.startswith((
+            "peak_queue_", "avg_wait_", "peak_wait_",
+            "peak_marshalling_", "avg_marshalling_", "marshalling_",
+            "last_entry_",
+        ))
         and c != "peak_queue_hour"
     ]
     metrics = _percentile_summary(df, metric_columns)
@@ -791,6 +883,7 @@ def run_monte_carlo(
             "demand_variability": demand_variability,
             "management_enabled": management_enabled,
             "max_entries_per_hour": max_entries_per_hour,
+            "route_randomization": route_randomization,
             "seed": int(seed),
             "roads_simulated": False,
             "junctions_simulated": False,
