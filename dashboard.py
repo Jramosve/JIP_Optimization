@@ -591,7 +591,16 @@ if flow_errors:
     st.error("Please correct the following inputs before running:\n\n" + "\n".join(flow_errors))
 run_ok=not flow_errors
 
+# Inputs shared by the simulation run and the gate Monte Carlo. Used to flag
+# when the Monte Carlo is compared against a run made with other inputs.
+scenario_signature=repr((int(trucks_per_day),arrival_time_randomization_pct,bool(management_enabled),int(max_entries),
+    sorted(entry_rules.items()),sorted(exit_rules.items()),sorted((g,sorted(v.items())) for g,v in gate_lanes.items()),
+    sorted(gate_times.items()),sorted(terminal_shares.items()),sorted((k,sorted(v.items())) for k,v in cargo_shares.items()),
+    float(average_speed),sorted((k,sorted(v.items())) for k,v in junctions.items()),
+    sorted((k,sorted(v.items())) for k,v in terminal_process.items()),sorted(route_overrides.items())))
+
 if "result" not in st.session_state: st.session_state.result=None
+if "result_signature" not in st.session_state: st.session_state.result_signature=None
 if "base_result" not in st.session_state: st.session_state.base_result=None
 if "mc_result" not in st.session_state: st.session_state.mc_result=None
 
@@ -618,6 +627,7 @@ if st.button("Run simulation",type="primary",disabled=not run_ok):
                 logistics_destination_daily=None,terminal_shares={k:0.40 if k=="RSGT" else 0.35 if k=="DPW" else 0.20 if k=="MPT" else 0.05 for k in TERMINALS},cargo_shares={k:{"FULL":0.70,"EMPTY":0.30} for k in TERMINALS},save_outputs=False)
         else:
             st.session_state.base_result=None
+    st.session_state.result_signature=scenario_signature
     st.session_state.mc_result=None
 
 result=st.session_state.result
@@ -684,135 +694,140 @@ st.caption("Gate queue stock includes trucks waiting at the gate and trucks dela
 
 
 st.subheader("Monte Carlo — Gate congestion")
-mc_sims=st.number_input("Number of Monte Carlo scenarios",100,20000,1000,100)
-if st.button("Run Gate Monte Carlo"):
-    with st.spinner(f"Running {int(mc_sims):,} gate-congestion scenarios..."):
-        st.session_state.mc_result=monte_carlo.run_monte_carlo(
-            model,
-            int(mc_sims),
-            int(trucks_per_day),
-            arrival_time_randomization_pct/100,
-            0.03,
-            management_enabled,
-            int(max_entries),
-            int(seed),
-            entry_gate_rules=entry_rules,
-            exit_gate_rules=exit_rules,
-            entry_access_rules=entry_rules,
-            gate_lanes=gate_lanes,
-            gate_times_sec=gate_times,
-            terminal_shares=terminal_shares,
-            cargo_shares=cargo_shares,
-        )
+st.caption("Fast gate model: reproduces main.py demand, hourly profile, ELM appointment cap, cargo mix, gate allocation, gate lanes and processing times, and the truck cycle (entry gate → route → terminal → route → exit gate). Road-link and junction queueing are not simulated, so results can diverge from the full simulation only when the internal network itself is saturated.")
+mc1,mc2,mc3=st.columns(3)
+mc_sims=mc1.number_input("Number of Monte Carlo scenarios",100,20000,1000,100)
+mc_share_var_pct=mc2.slider("Terminal / cargo share variability (%)",0,20,0,1,help="0% = same terminal and Full/Empty shares as the simulation run; variability then comes only from the hourly profile and random cargo/gate choices, exactly as in main.py.")
+mc3.metric("Hourly profile variability",f"{arrival_time_randomization_pct}%",help="Taken from the sidebar so the Monte Carlo describes the same scenario as the simulation run.")
+if st.button("Run Gate Monte Carlo",disabled=not run_ok):
+    progress=st.progress(0.0,text="Running gate-congestion scenarios...")
+    st.session_state.mc_result=monte_carlo.run_monte_carlo(
+        model,
+        int(mc_sims),
+        int(trucks_per_day),
+        arrival_time_randomization_pct/100,
+        mc_share_var_pct/100,
+        management_enabled,
+        int(max_entries),
+        int(seed),
+        entry_access_rules=entry_rules,
+        exit_gate_rules=exit_rules,
+        gate_lanes=gate_lanes,
+        gate_times_sec=gate_times,
+        terminal_shares=terminal_shares,
+        cargo_shares=cargo_shares,
+        average_speed_kmh=average_speed,
+        junctions=junctions,
+        terminal_process_min=terminal_process,
+        route_overrides=route_overrides,
+        graph=graph,
+        progress_callback=lambda done,total: progress.progress(done/total,text=f"Running gate-congestion scenarios... {done:,}/{total:,}"),
+    )
+    st.session_state.mc_signature=scenario_signature
+    progress.empty()
 
 mc=st.session_state.mc_result
 if mc:
     m=mc.get("metrics", {})
     results=mc.get("results", pd.DataFrame()).copy()
-    st.caption("Fast gate-congestion Monte Carlo: simulates the current truck demand, hourly arrival profile, appointment cap, cargo mix and gate allocations. Road links, junctions and network V/C are intentionally excluded.")
+    cfg_mc=mc.get("configuration", {})
+    percentile_labels=list(monte_carlo.PERCENTILES)
+    comparable=st.session_state.get("mc_signature")==st.session_state.result_signature
+    if not comparable:
+        st.warning("The simulation run above used different inputs from this Monte Carlo. Re-run the simulation to compare them.")
 
-    # ------------------------------------------------------------
-    # Peak gate queue — main Monte Carlo output
-    # ------------------------------------------------------------
-    st.subheader("Peak gate queue")
-    percentile_labels=["P10","P50","P90","P95","P99"]
-    peak_all=m.get("peak_queue_all", {})
-    cols=st.columns(5)
-    for i,label in enumerate(percentile_labels):
-        value=float(peak_all.get(label, 0.0))
-        cols[i].metric(label, f"{value:.0f} trucks")
-
-    # Peak queue by gate
-    st.subheader("Peak queue by gate")
-    summary_rows=[]
+    # Values from the current simulation run, using the same definitions as the
+    # Monte Carlo: queue stock = trucks waiting + in service, sampled every
+    # 5 minutes until 24:00; queue time = wait before gate processing.
+    run_values={}
+    qs_day=queue_stock[queue_stock.time_min<=24*60]
     for g in GATES:
-        vals=m.get(f"peak_queue_{g}", {})
-        summary_rows.append({"Gate":g, **{p:float(vals.get(p,0.0)) for p in percentile_labels}})
-    st.dataframe(pd.DataFrame(summary_rows).set_index("Gate"),use_container_width=True)
+        for op in ["ENTRY","EXIT"]:
+            q=qs_day[(qs_day.gate==g)&(qs_day.operation==op)].queue_stock
+            w=gates[(gates.gate==g)&(gates.operation==op)].wait_min
+            run_values[f"peak_queue_{g}_{op}"]=float(q.max()) if len(q) else 0.0
+            run_values[f"avg_wait_{g}_{op}"]=float(w.mean()) if len(w) else 0.0
+            run_values[f"peak_wait_{g}_{op}"]=float(w.max()) if len(w) else 0.0
+    run_values["peak_queue_all"]=max(v for k,v in run_values.items() if k.startswith("peak_queue_"))
+    run_values["avg_wait_all"]=float(gates.wait_min.mean()) if not gates.empty else 0.0
+    run_values["peak_wait_all"]=float(gates.wait_min.max()) if not gates.empty else 0.0
+
+    st.caption(f'{cfg_mc.get("simulations",0):,} scenarios · {cfg_mc.get("trucks_per_day",0):,} trucks/day · hourly variability {cfg_mc.get("arrival_variability",0)*100:.0f}% · share variability {cfg_mc.get("demand_variability",0)*100:.0f}% · ELM cap {"on, "+format(cfg_mc.get("max_entries_per_hour",0),",")+"/h" if cfg_mc.get("management_enabled") else "off"}')
+
+    for title,key,unit,fmt in [("Peak gate queue — all gates","peak_queue_all","trucks","{:.0f}"),("Peak gate queue time","peak_wait_all","min","{:.1f}"),("Average gate queue time","avg_wait_all","min","{:.1f}")]:
+        st.markdown(f"**{title}**")
+        cols=st.columns(6)
+        vals=m.get(key,{})
+        for i,label in enumerate(percentile_labels):
+            cols[i].metric(label,f"{fmt.format(float(vals.get(label,0.0)))} {unit}")
+        cols[5].metric("Simulation run",f"{fmt.format(run_values[key])} {unit}")
+
+    st.subheader("Gate percentiles vs simulation run")
+    summary_rows=[]
+    dist_options={"All gates — Peak queue (trucks)":"peak_queue_all","All gates — Peak queue time (min)":"peak_wait_all","All gates — Avg queue time (min)":"avg_wait_all"}
+    for g in GATES:
+        for op in ["ENTRY","EXIT"]:
+            lanes=int(gate_lanes.get(g,{}).get(op.lower(),0))
+            if lanes<=0: continue
+            for metric_key,metric_name in [("peak_queue","Peak queue (trucks)"),("peak_wait","Peak queue time (min)"),("avg_wait","Avg queue time (min)")]:
+                col=f"{metric_key}_{g}_{op}"
+                vals=m.get(col,{})
+                dist_options[f"{g} {op} — {metric_name}"]=col
+                summary_rows.append({"Gate":f"{g} {op}","Lanes":lanes,"Metric":metric_name,
+                                     **{p:float(vals.get(p,0.0)) for p in percentile_labels},
+                                     "Simulation run":run_values.get(col,0.0)})
+    st.dataframe(pd.DataFrame(summary_rows),use_container_width=True,hide_index=True,
+                 column_config={c:st.column_config.NumberColumn(format="%.1f") for c in percentile_labels+["Simulation run"]})
+    st.caption("Queue = trucks waiting plus in service at the gate (same definition as the gate queue profile above). The simulation run is a single realisation and is expected to fall inside the P10–P90 band most of the time.")
 
     # ------------------------------------------------------------
-    # Distribution selector — gate queues only
+    # Distribution selector
     # ------------------------------------------------------------
     st.subheader("Monte Carlo output distribution")
-    st.caption("Select a gate to inspect the distribution of its peak queue across all Monte Carlo scenarios. P10, P50, P90, P95 and P99 are shown explicitly.")
-
-    selected_gate=st.selectbox("Gate", GATES, index=1, key="mc_distribution_gate")
-    value_col=f"peak_queue_{selected_gate}"
-
-    if value_col in results.columns:
-        values=pd.to_numeric(results[value_col],errors="coerce").dropna()
-    else:
-        values=pd.Series(dtype=float)
+    selected_label=st.selectbox("Output",list(dist_options),index=0,key="mc_distribution_output")
+    value_col=dist_options[selected_label]
+    values=pd.to_numeric(results[value_col],errors="coerce").dropna() if value_col in results.columns else pd.Series(dtype=float)
 
     if not values.empty:
-        percentiles={p:float(values.quantile(q)) for p,q in {"P10":0.10,"P50":0.50,"P90":0.90,"P95":0.95,"P99":0.99}.items()}
+        percentiles={p:float(values.quantile(q)) for p,q in monte_carlo.PERCENTILES.items()}
 
-        n_bins=30
         vmin,vmax=float(values.min()),float(values.max())
-        if np.isclose(vmin,vmax):
-            edges=np.array([vmin-0.5,vmax+0.5])
-        else:
-            edges=np.linspace(vmin,vmax,n_bins+1)
+        edges=np.array([vmin-0.5,vmax+0.5]) if np.isclose(vmin,vmax) else np.linspace(vmin,vmax,31)
         counts,edges=np.histogram(values.to_numpy(),bins=edges)
         centers=(edges[:-1]+edges[1:])/2.0
-        widths=np.diff(edges)
 
         fig=go.Figure()
         fig.add_trace(go.Bar(
-            x=centers,
-            y=counts,
-            width=widths*0.92,
-            marker_color="#4f8cff",
-            marker_line_width=0,
-            hovertemplate=f"Peak queue at {selected_gate}: %{{x:.0f}} trucks<br>Frequency: %{{y}}<extra></extra>",
+            x=centers,y=counts,width=np.diff(edges)*0.92,
+            marker_color="#4f8cff",marker_line_width=0,
+            hovertemplate=f"{html.escape(selected_label)}: %{{x:.1f}}<br>Frequency: %{{y}}<extra></extra>",
             name="Frequency",
         ))
-
         percentile_colors={"P10":"#f59e0b","P50":"#7c8ea3","P90":"#94a3b8","P95":"#6ee7b7","P99":"#67e8f9"}
         for p,value in percentiles.items():
-            fig.add_vline(
-                x=value,
-                line_width=2,
-                line_dash="dash",
-                line_color=percentile_colors[p],
-                annotation_text=f"{p}: {value:.0f}",
-                annotation_position="top",
-                annotation_font_color=percentile_colors[p],
-            )
-
+            fig.add_vline(x=value,line_width=2,line_dash="dash",line_color=percentile_colors[p],
+                          annotation_text=f"{p}: {value:.1f}",annotation_position="top",annotation_font_color=percentile_colors[p])
+        if value_col in run_values:
+            fig.add_vline(x=run_values[value_col],line_width=3,line_color="#f2f4f7",
+                          annotation_text=f"Run: {run_values[value_col]:.1f}",annotation_position="bottom right",annotation_font_color="#f2f4f7")
         fig.update_layout(
-            height=430,
-            margin=dict(l=20,r=20,t=25,b=20),
-            paper_bgcolor="#12161c",
-            plot_bgcolor="#12161c",
-            font=dict(color="#f2f4f7"),
-            xaxis=dict(title=f"Peak queue at {selected_gate} (trucks)",gridcolor="#2a3038",zeroline=False),
+            height=430,margin=dict(l=20,r=20,t=25,b=20),
+            paper_bgcolor="#12161c",plot_bgcolor="#12161c",font=dict(color="#f2f4f7"),
+            xaxis=dict(title=selected_label,gridcolor="#2a3038",zeroline=False),
             yaxis=dict(title="Frequency",gridcolor="#2a3038",zeroline=False),
-            bargap=0.05,
-            showlegend=False,
+            bargap=0.05,showlegend=False,
         )
         st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False})
 
-        c1,c2,c3,c4,c5=st.columns(5)
-        for col,p in zip([c1,c2,c3,c4,c5],percentiles):
-            col.metric(p,f"{percentiles[p]:.0f} trucks")
-
         pct_df=pd.DataFrame({"Percentile":list(percentiles.keys()),"Value":list(percentiles.values())})
-
-        # Downloads — keep only gate Monte Carlo outputs
         export_cols=[c for c in ["simulation","daily_demand",value_col] if c in results.columns]
-        selected_export=results[export_cols].copy()
-        selected_export.columns=["simulation","daily_demand",f"Peak queue — {selected_gate}"][:len(selected_export.columns)]
-        csv_selected=selected_export.to_csv(index=False).encode("utf-8")
-        csv_all=results.to_csv(index=False).encode("utf-8")
-        csv_percentiles=pct_df.to_csv(index=False).encode("utf-8")
-
+        selected_export=results[export_cols].rename(columns={value_col:selected_label})
         d1,d2,d3=st.columns(3)
-        d1.download_button("Download selected gate distribution",csv_selected,"jeddah_monte_carlo_selected_gate.csv","text/csv",key="download_mc_selected")
-        d2.download_button("Download all gate Monte Carlo results",csv_all,"jeddah_monte_carlo_all_gate_results.csv","text/csv",key="download_mc_all")
-        d3.download_button("Download percentile summary",csv_percentiles,"jeddah_monte_carlo_gate_percentiles.csv","text/csv",key="download_mc_percentiles")
+        d1.download_button("Download selected distribution",selected_export.to_csv(index=False).encode("utf-8"),"jeddah_monte_carlo_selected.csv","text/csv",key="download_mc_selected")
+        d2.download_button("Download all gate Monte Carlo results",results.to_csv(index=False).encode("utf-8"),"jeddah_monte_carlo_all_gate_results.csv","text/csv",key="download_mc_all")
+        d3.download_button("Download percentile summary",pct_df.to_csv(index=False).encode("utf-8"),"jeddah_monte_carlo_gate_percentiles.csv","text/csv",key="download_mc_percentiles")
     else:
-        st.info(f"No Monte Carlo results are available for {selected_gate}.")
+        st.info(f"No Monte Carlo results are available for {selected_label}.")
 
 st.subheader("Main junction bottlenecks")
 st.caption("Node congestion is assessed from peak hourly movements through each junction relative to its configured effective capacity. Delay is shown separately because downstream spillback can create waiting even when node V/C remains below 1.0.")
