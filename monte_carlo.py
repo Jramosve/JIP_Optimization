@@ -1,41 +1,25 @@
+
 """
-Monte Carlo wrapper for the Jeddah Islamic Port traffic model.
+Fast gate-only Monte Carlo model for Jeddah Islamic Port.
 
-IMPORTANT
----------
-This module uses the SAME SimPy simulation engine as main.py.
+This model deliberately does NOT run the full road/network SimPy model.
+It reproduces the demand, terminal/cargo allocation, gate allocation,
+appointment management, gate lanes and gate service times from main.py,
+and calculates gate queues only.
 
-Each Monte Carlo replication:
-    1. Generates an independent random seed.
-    2. Calls main.run_simulation(...)
-    3. Extracts ONLY the maximum physical queue at each gate.
-    4. Returns the gate congestion results.
-
-main.py is NOT modified.
-
-The Monte Carlo is parallelised using multiprocessing.
+Use this for large Monte Carlo experiments (e.g. 10,500 trucks x 1,000
+scenarios). Use main.py for full network validation.
 """
 
 from __future__ import annotations
 
-import contextlib
-import io
-import multiprocessing as mp
-import os
-import traceback
-
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
-
+import math
+import random
 from copy import deepcopy
 
 import numpy as np
 import pandas as pd
 
-
-# ============================================================
-# PERCENTILES
-# ============================================================
 
 PERCENTILES = {
     "P10": 0.10,
@@ -45,73 +29,41 @@ PERCENTILES = {
     "P99": 0.99,
 }
 
+QUEUE_SNAPSHOT_INTERVAL_MIN = 5.0
 
-# ============================================================
-# SHARE UTILITIES
-# ============================================================
+# Exact base hourly profile used by main.py.
+BASE_HOURLY_SHARES = np.array([
+    0.035, 0.030, 0.021, 0.015, 0.018, 0.019,
+    0.036, 0.036, 0.043, 0.048, 0.048, 0.051,
+    0.050, 0.048, 0.055, 0.056, 0.053, 0.056,
+    0.048, 0.046, 0.047, 0.051, 0.048, 0.042,
+], dtype=float)
+BASE_HOURLY_SHARES /= BASE_HOURLY_SHARES.sum()
+
 
 def _normalise_shares(values):
-    """
-    Normalise a dictionary of shares so that they sum to 1.
-    """
-
     values = {
         str(k): max(float(v), 0.0)
         for k, v in values.items()
     }
-
     total = sum(values.values())
-
     if total <= 0:
-        raise ValueError(
-            "Shares must sum to a positive value."
-        )
-
-    return {
-        k: v / total
-        for k, v in values.items()
-    }
+        raise ValueError("Shares must sum to a positive value.")
+    return {k: v / total for k, v in values.items()}
 
 
-def _perturb_shares(
-    base,
-    rng,
-    variability,
-):
-    """
-    Apply controlled multiplicative variation to shares.
-
-    If variability = 0, the original scenario shares
-    are preserved exactly.
-    """
-
+def _perturb_shares(base, rng, variability):
     base = _normalise_shares(base)
-
-    if variability <= 0:
+    if float(variability) <= 0:
         return base
 
     keys = list(base.keys())
-
-    raw = np.array(
-        [
-            base[k]
-            * np.exp(
-                rng.normal(
-                    0.0,
-                    float(variability),
-                )
-            )
-            for k in keys
-        ],
-        dtype=float,
-    )
-
+    raw = np.array([
+        base[k] * np.exp(rng.normal(0.0, float(variability)))
+        for k in keys
+    ], dtype=float)
     raw /= raw.sum()
-
-    return {
-        k: float(v)
-        for k, v in zip(keys, raw)
-    }
+    return {k: float(v) for k, v in zip(keys, raw)}
 
 
 def _build_realisation_shares(
@@ -120,419 +72,639 @@ def _build_realisation_shares(
     rng,
     variability,
 ):
-    """
-    Create one stochastic terminal/cargo realisation.
-
-    With variability = 0, the scenario is preserved exactly.
-    """
-
-    realised_terminal = _perturb_shares(
-        base_terminal_shares,
-        rng,
-        variability,
+    terminal = _perturb_shares(
+        base_terminal_shares, rng, variability
     )
-
-    realised_cargo = {}
-
-    for terminal, shares in base_cargo_shares.items():
-
-        realised_cargo[terminal] = _perturb_shares(
-            shares,
-            rng,
-            variability,
+    cargo = {
+        terminal_name: _perturb_shares(
+            shares, rng, variability
         )
+        for terminal_name, shares in base_cargo_shares.items()
+    }
+    return terminal, cargo
 
-    return (
-        realised_terminal,
-        realised_cargo,
+
+def _allocate_integer_counts(total, weights):
+    """
+    Same largest-remainder principle used by main.py.
+    """
+    keys = list(weights.keys())
+    raw = np.array(
+        [float(weights[k]) for k in keys],
+        dtype=float,
     )
+    raw = raw / raw.sum() * int(total)
+
+    base = np.floor(raw).astype(int)
+    remainder = int(total) - int(base.sum())
+
+    if remainder > 0:
+        order = np.argsort(-(raw - base))
+        for idx in order[:remainder]:
+            base[idx] += 1
+
+    return {
+        k: int(v)
+        for k, v in zip(keys, base)
+    }
 
 
-# ============================================================
-# GATE QUEUE EXTRACTION
-# ============================================================
+def _weighted_choice(options, weights, rng):
+    """
+    Python-random equivalent of the weighted selection used in main.py.
+    """
+    return rng.choices(
+        options,
+        weights=weights,
+        k=1,
+    )[0]
 
-def _extract_peak_gate_queues(
-    result,
-    gates,
+
+def _generate_arrival_times(
+    number_of_trucks,
+    rng,
+    variability,
 ):
     """
-    Extract the maximum physical queue at each gate.
+    Reproduce main.py's current arrival-time logic:
 
-    Uses the SAME queue_stock dataframe generated by main.py.
+    - exact daily demand
+    - current 24-hour profile
+    - hourly perturbation controlled by variability
+    - approximately uniform arrivals within each hour
+    - sorted arrival times
+    """
+    hourly = BASE_HOURLY_SHARES.copy()
+    variability = float(variability)
 
-    No road or junction KPI is calculated.
+    if not 0 <= variability <= 1:
+        raise ValueError(
+            "arrival_time_variability must be between 0 and 1."
+        )
+
+    if variability > 0:
+        noise = np.exp(np.array([
+            rng.gauss(0.0, variability * 0.12)
+            for _ in range(24)
+        ]))
+        hourly *= noise
+        hourly /= hourly.sum()
+
+    raw = hourly * int(number_of_trucks)
+    counts = np.floor(raw).astype(int)
+    remainder = int(number_of_trucks) - int(counts.sum())
+
+    if remainder > 0:
+        for idx in np.argsort(-(raw - counts))[:remainder]:
+            counts[idx] += 1
+
+    arrivals = []
+
+    for hour, count in enumerate(counts):
+        if count <= 0:
+            continue
+
+        for i in range(int(count)):
+            frac = (i + 0.5) / count
+            jitter = rng.uniform(
+                -0.25 / max(count, 1),
+                0.25 / max(count, 1),
+            )
+
+            minute = min(
+                59.999,
+                max(
+                    0.0,
+                    (frac + jitter) * 60.0,
+                ),
+            )
+
+            arrivals.append(
+                hour * 60.0 + minute
+            )
+
+    arrivals.sort()
+    return arrivals
+
+
+def _apply_entry_appointment_cap(
+    arrival_times,
+    max_entries_per_hour,
+):
+    """
+    Reproduce main.py's appointment logic.
+
+    Demand above the hourly cap becomes FIFO backlog and rolls into
+    subsequent hours. Released appointments are spread continuously
+    through each hour.
+
+    The function may release trucks after 24:00 if the cap requires it.
     """
 
-    queue_stock = result.get(
-        "queue_stock",
-        None,
-    )
+    if max_entries_per_hour is None:
+        return sorted(arrival_times)
 
-    peaks = {
-        gate: 0.0
-        for gate in gates
-    }
+    cap = int(max_entries_per_hour)
+    if cap <= 0:
+        raise ValueError(
+            "max_entries_per_hour must be > 0."
+        )
 
-    if queue_stock is None:
-        return peaks
+    by_hour = {}
 
-    if queue_stock.empty:
-        return peaks
+    for t in arrival_times:
+        hour = max(
+            0,
+            int(float(t) // 60),
+        )
+        by_hour.setdefault(
+            hour,
+            [],
+        ).append(float(t))
 
-    required_columns = {
-        "gate",
-        "queue_stock",
-    }
+    for hour in by_hour:
+        by_hour[hour].sort()
 
-    if not required_columns.issubset(
-        queue_stock.columns
+    backlog = []
+    released_times = []
+    hour = 0
+
+    while (
+        hour < 24
+        or backlog
+        or hour in by_hour
     ):
-        return peaks
+        current = by_hour.get(
+            hour,
+            [],
+        )
 
-    grouped = (
-        queue_stock
-        .groupby("gate")["queue_stock"]
-        .max()
+        pool = backlog + current
+
+        release = min(
+            cap,
+            len(pool),
+        )
+
+        backlog = pool[release:]
+
+        if release:
+            for i in range(release):
+                minute = (
+                    (i + 0.5)
+                    / release
+                    * 60.0
+                )
+
+                released_times.append(
+                    hour * 60.0 + minute
+                )
+
+        hour += 1
+
+    if len(released_times) != len(arrival_times):
+        raise RuntimeError(
+            "Appointment management released "
+            f"{len(released_times):,} of "
+            f"{len(arrival_times):,} trucks."
+        )
+
+    return released_times
+
+
+def _build_truck_gate_flows(
+    trucks_per_day,
+    random_seed,
+    terminal_shares,
+    cargo_shares,
+    entry_access_rules,
+    exit_gate_rules,
+    arrival_variability,
+    appointment_management_enabled,
+    max_entries_per_hour,
+):
+    """
+    Reproduce the gate-relevant part of main.py's create_trucks().
+
+    Roads, nodes, destinations and routes are deliberately omitted.
+    """
+
+    rng = random.Random(
+        int(random_seed)
     )
+
+    # Same terminal count allocation as main.py.
+    terminal_counts = _allocate_integer_counts(
+        trucks_per_day,
+        terminal_shares,
+    )
+
+    terminal_assignments = []
+
+    for terminal, count in terminal_counts.items():
+        terminal_assignments.extend(
+            [terminal] * int(count)
+        )
+
+    # Same shuffle concept as main.py.
+    rng.shuffle(
+        terminal_assignments
+    )
+
+    # Arrival generation happens before cargo/gate selection in main.py.
+    arrival_times = _generate_arrival_times(
+        trucks_per_day,
+        rng,
+        arrival_variability,
+    )
+
+    if appointment_management_enabled:
+        arrival_times = _apply_entry_appointment_cap(
+            arrival_times,
+            max_entries_per_hour,
+        )
+
+    records = []
+
+    for i in range(
+        int(trucks_per_day)
+    ):
+        terminal = terminal_assignments[i]
+
+        cargo_options = list(
+            cargo_shares[terminal].keys()
+        )
+        cargo_weights = list(
+            cargo_shares[terminal].values()
+        )
+
+        cargo = _weighted_choice(
+            cargo_options,
+            cargo_weights,
+            rng,
+        )
+
+        entry_options = [
+            x[0]
+            for x in entry_access_rules[
+                (terminal, cargo)
+            ]
+        ]
+        entry_weights = [
+            x[1]
+            for x in entry_access_rules[
+                (terminal, cargo)
+            ]
+        ]
+
+        entry_gate = _weighted_choice(
+            entry_options,
+            entry_weights,
+            rng,
+        )
+
+        exit_options = [
+            x[0]
+            for x in exit_gate_rules[
+                (terminal, cargo)
+            ]
+        ]
+        exit_weights = [
+            x[1]
+            for x in exit_gate_rules[
+                (terminal, cargo)
+            ]
+        ]
+
+        exit_gate = _weighted_choice(
+            exit_options,
+            exit_weights,
+            rng,
+        )
+
+        records.append(
+            (
+                arrival_times[i],
+                entry_gate,
+                exit_gate,
+                cargo,
+            )
+        )
+
+    return records
+
+
+def _simulate_gate_queue(
+    arrivals,
+    service_times_sec,
+    lanes,
+    snapshot_times,
+):
+    """
+    Deterministic multi-server FCFS gate queue.
+
+    For each truck:
+        service_start = max(arrival, earliest lane available)
+
+    Queue stock at a snapshot is the number of trucks that have arrived
+    but whose gate service has not started yet.
+
+    This corresponds to the resource.queue concept used by GateManager
+    in main.py.
+    """
+    if lanes <= 0:
+        return 0.0
+
+    arrivals = np.asarray(
+        arrivals,
+        dtype=float,
+    )
+
+    if len(arrivals) == 0:
+        return 0.0
+
+    service_times = np.asarray(
+        service_times_sec,
+        dtype=float,
+    ) / 60.0
+
+    # Each lane stores its next available time.
+    lane_free = np.zeros(
+        int(lanes),
+        dtype=float,
+    )
+
+    start_times = np.empty(
+        len(arrivals),
+        dtype=float,
+    )
+
+    for i, arrival in enumerate(arrivals):
+        lane_idx = int(
+            np.argmin(lane_free)
+        )
+
+        start = max(
+            float(arrival),
+            float(lane_free[lane_idx]),
+        )
+
+        start_times[i] = start
+
+        lane_free[lane_idx] = (
+            start
+            + service_times[i]
+        )
+
+    peak_queue = 0
+
+    # Queue = arrived but not yet started.
+    # Since both arrays are sorted, searchsorted gives this directly.
+    for t in snapshot_times:
+        arrived = int(
+            np.searchsorted(
+                arrivals,
+                t,
+                side="right",
+            )
+        )
+
+        started = int(
+            np.searchsorted(
+                start_times,
+                t,
+                side="right",
+            )
+        )
+
+        queue = max(
+            0,
+            arrived - started,
+        )
+
+        if queue > peak_queue:
+            peak_queue = queue
+
+    return float(peak_queue)
+
+
+def _simulate_one_scenario(
+    scenario,
+    simulation_number,
+    simulation_seed,
+):
+    """
+    Run one gate-only scenario.
+    """
+
+    terminal_shares, cargo_shares = (
+        _build_realisation_shares(
+            scenario["terminal_shares"],
+            scenario["cargo_shares"],
+            np.random.default_rng(
+                int(simulation_seed)
+            ),
+            scenario["demand_variability"],
+        )
+    )
+
+    records = _build_truck_gate_flows(
+        trucks_per_day=scenario["trucks_per_day"],
+        random_seed=simulation_seed,
+        terminal_shares=terminal_shares,
+        cargo_shares=cargo_shares,
+        entry_access_rules=scenario[
+            "entry_access_rules"
+        ],
+        exit_gate_rules=scenario[
+            "exit_gate_rules"
+        ],
+        arrival_variability=scenario[
+            "arrival_variability"
+        ],
+        appointment_management_enabled=scenario[
+            "management_enabled"
+        ],
+        max_entries_per_hour=scenario[
+            "max_entries_per_hour"
+        ],
+    )
+
+    gates = list(
+        scenario["gate_lanes"].keys()
+    )
+
+    gate_times = scenario[
+        "gate_times_sec"
+    ]
+
+    # main.py snapshots queues every 5 minutes and stops monitoring
+    # at 24:00.
+    snapshot_times = np.arange(
+        0.0,
+        24.0 * 60.0 + 0.0001,
+        QUEUE_SNAPSHOT_INTERVAL_MIN,
+    )
+
+    peak_queues = {}
 
     for gate in gates:
 
-        if gate in grouped.index:
+        # ------------------------------
+        # ENTRY
+        # ------------------------------
 
-            value = grouped.loc[gate]
-
-            if pd.notna(value):
-                peaks[gate] = float(value)
-
-    return peaks
-
-
-# ============================================================
-# SINGLE SIMULATION WORKER
-# ============================================================
-
-def _run_single_simulation(task):
-    """
-    Execute ONE real SimPy replication.
-
-    The worker imports main itself.
-
-    IMPORTANT:
-    Ordinary Python exceptions are caught and returned to the
-    parent process so that we can see the actual error instead
-    of only receiving BrokenProcessPool.
-    """
-
-    (
-        simulation_number,
-        simulation_seed,
-        scenario,
-    ) = task
-
-    worker_pid = os.getpid()
-
-    try:
-
-        # ----------------------------------------------------
-        # Import main INSIDE the worker
-        # ----------------------------------------------------
-
-        import main as model
-
-        # ----------------------------------------------------
-        # Read scenario
-        # ----------------------------------------------------
-
-        trucks_per_day = scenario[
-            "trucks_per_day"
-        ]
-
-        arrival_variability = scenario[
-            "arrival_variability"
-        ]
-
-        management_enabled = scenario[
-            "management_enabled"
-        ]
-
-        max_entries_per_hour = scenario[
-            "max_entries_per_hour"
-        ]
-
-        average_speed_kmh = scenario[
-            "average_speed_kmh"
-        ]
-
-        lanes_per_direction = scenario[
-            "lanes_per_direction"
-        ]
-
-        capacity_per_lane_vph = scenario[
-            "capacity_per_lane_vph"
-        ]
-
-        n2_n1_corridor_lanes = scenario[
-            "n2_n1_corridor_lanes"
-        ]
-
-        route_randomization = scenario[
-            "route_randomization"
-        ]
-
-        demand_variability = scenario[
-            "demand_variability"
-        ]
-
-        # ----------------------------------------------------
-        # Generate scenario-specific shares
-        # ----------------------------------------------------
-
-        rng = np.random.default_rng(
-            int(simulation_seed)
+        entry_lanes = int(
+            scenario["gate_lanes"]
+            .get(gate, {})
+            .get("entry", 0)
         )
 
-        (
-            realised_terminal_shares,
-            realised_cargo_shares,
-        ) = _build_realisation_shares(
-            base_terminal_shares=scenario[
-                "terminal_shares"
-            ],
-            base_cargo_shares=scenario[
-                "cargo_shares"
-            ],
-            rng=rng,
-            variability=demand_variability,
-        )
+        if entry_lanes > 0:
 
-        # ----------------------------------------------------
-        # Run REAL SimPy model
-        # ----------------------------------------------------
+            entry_rows = [
+                row
+                for row in records
+                if row[1] == gate
+            ]
 
-        # main.py prints a lot of information after each run.
-        # Suppress that output.
-        with contextlib.redirect_stdout(
-            io.StringIO()
-        ):
-
-            result = model.run_simulation(
-
-                # Demand
-                trucks_per_day=int(
-                    trucks_per_day
-                ),
-
-                # Randomisation
-                route_randomization=float(
-                    route_randomization
-                ),
-
-                seed=int(
-                    simulation_seed
-                ),
-
-                arrival_time_variability=float(
-                    arrival_variability
-                ),
-
-                # Gate configuration
-                entry_gate_rules=deepcopy(
-                    scenario[
-                        "entry_gate_rules"
-                    ]
-                ),
-
-                exit_gate_rules=deepcopy(
-                    scenario[
-                        "exit_gate_rules"
-                    ]
-                ),
-
-                entry_access_rules=deepcopy(
-                    scenario[
-                        "entry_access_rules"
-                    ]
-                ),
-
-                gate_lanes=deepcopy(
-                    scenario[
-                        "gate_lanes"
-                    ]
-                ),
-
-                gate_times_sec=deepcopy(
-                    scenario[
-                        "gate_times_sec"
-                    ]
-                ),
-
-                # Road configuration
-                average_speed_kmh=float(
-                    average_speed_kmh
-                ),
-
-                lanes_per_direction=int(
-                    lanes_per_direction
-                ),
-
-                capacity_per_lane_vph=int(
-                    capacity_per_lane_vph
-                ),
-
-                n2_n1_corridor_lanes=int(
-                    n2_n1_corridor_lanes
-                ),
-
-                # Junctions
-                junctions=deepcopy(
-                    scenario[
-                        "junctions"
-                    ]
-                ),
-
-                # Appointment management
-                appointment_management_enabled=bool(
-                    management_enabled
-                ),
-
-                max_entries_per_hour=int(
-                    max_entries_per_hour
-                ),
-
-                # Routing
-                route_overrides=deepcopy(
-                    scenario[
-                        "route_overrides"
-                    ]
-                ),
-
-                # Logistics
-                logistics_destination_daily=deepcopy(
-                    scenario[
-                        "logistics_destination_daily"
-                    ]
-                ),
-
-                # Terminal / cargo
-                terminal_shares=deepcopy(
-                    realised_terminal_shares
-                ),
-
-                cargo_shares=deepcopy(
-                    realised_cargo_shares
-                ),
-
-                # Do not write CSV/KML files
-                save_outputs=False,
+            entry_rows.sort(
+                key=lambda x: x[0]
             )
 
-        # ----------------------------------------------------
-        # Extract ONLY gate congestion
-        # ----------------------------------------------------
+            entry_arrivals = [
+                row[0]
+                for row in entry_rows
+            ]
 
-        gates = list(
-            scenario[
-                "gate_lanes"
-            ].keys()
-        )
+            entry_service = [
+                float(
+                    gate_times[
+                        (
+                            "FULL_ENTRY"
+                            if row[3] == "FULL"
+                            else "EMPTY_ENTRY"
+                        )
+                    ]
+                )
+                for row in entry_rows
+            ]
 
-        peak_queue = _extract_peak_gate_queues(
-            result=result,
-            gates=gates,
-        )
-
-        # ----------------------------------------------------
-        # Compact result
-        # ----------------------------------------------------
-
-        row = {
-            "ok": True,
-
-            "simulation": int(
-                simulation_number
-            ),
-
-            "seed": int(
-                simulation_seed
-            ),
-
-            "daily_demand": int(
-                trucks_per_day
-            ),
-        }
-
-        for gate in gates:
-
-            row[
+            peak_queues[
                 f"peak_queue_{gate}"
-            ] = peak_queue.get(
-                gate,
-                0.0,
+            ] = _simulate_gate_queue(
+                entry_arrivals,
+                entry_service,
+                entry_lanes,
+                snapshot_times,
             )
 
-        row[
-            "peak_queue_all"
-        ] = (
-            max(
-                peak_queue.values()
-            )
-            if peak_queue
-            else 0.0
+        else:
+            peak_queues[
+                f"peak_queue_{gate}"
+            ] = 0.0
+
+        # ------------------------------
+        # EXIT
+        # ------------------------------
+
+        exit_lanes = int(
+            scenario["gate_lanes"]
+            .get(gate, {})
+            .get("exit", 0)
         )
 
-        return row
+        if exit_lanes > 0:
 
-    except Exception as exc:
+            exit_rows = [
+                row
+                for row in records
+                if row[2] == gate
+            ]
 
-        # ----------------------------------------------------
-        # IMPORTANT DIAGNOSTIC INFORMATION
-        # ----------------------------------------------------
+            exit_rows.sort(
+                key=lambda x: x[0]
+            )
 
-        return {
-            "ok": False,
+            exit_arrivals = [
+                row[0]
+                for row in exit_rows
+            ]
 
-            "simulation": int(
-                simulation_number
+            exit_service = [
+                float(
+                    gate_times[
+                        (
+                            "FULL_EXIT"
+                            if row[3] == "FULL"
+                            else "EMPTY_EXIT"
+                        )
+                    ]
+                )
+                for row in exit_rows
+            ]
+
+            exit_peak = _simulate_gate_queue(
+                exit_arrivals,
+                exit_service,
+                exit_lanes,
+                snapshot_times,
+            )
+
+            # Keep the dashboard's gate-level KPI as the maximum
+            # physical queue at the gate across entry and exit.
+            peak_queues[
+                f"peak_queue_{gate}"
+            ] = max(
+                peak_queues[
+                    f"peak_queue_{gate}"
+                ],
+                exit_peak,
+            )
+
+    row = {
+        "simulation": int(
+            simulation_number
+        ),
+        "seed": int(
+            simulation_seed
+        ),
+        "daily_demand": int(
+            scenario["trucks_per_day"]
+        ),
+    }
+
+    for gate in gates:
+        row[
+            f"peak_queue_{gate}"
+        ] = float(
+            peak_queues[
+                f"peak_queue_{gate}"
+            ]
+        )
+
+    row["peak_queue_all"] = float(
+        max(
+            (
+                row[
+                    f"peak_queue_{gate}"
+                ]
+                for gate in gates
             ),
+            default=0.0,
+        )
+    )
 
-            "seed": int(
-                simulation_seed
-            ),
+    return row
 
-            "worker_pid": int(
-                worker_pid
-            ),
-
-            "error_type": type(
-                exc
-            ).__name__,
-
-            "error": str(
-                exc
-            ),
-
-            "traceback": traceback.format_exc(),
-        }
-
-
-# ============================================================
-# PERCENTILE SUMMARY
-# ============================================================
 
 def _percentile_summary(
     df,
     columns,
 ):
-    """
-    Calculate P10 / P50 / P90 / P95 / P99
-    for gate congestion.
-    """
-
     metrics = {}
 
     for column in columns:
-
         if column not in df.columns:
             continue
 
@@ -541,337 +713,176 @@ def _percentile_summary(
             errors="coerce",
         ).dropna()
 
-        if values.empty:
-
-            metrics[column] = {
-                percentile: 0.0
-                for percentile in PERCENTILES
-            }
-
-        else:
-
-            metrics[column] = {
-                percentile: float(
-                    values.quantile(q)
-                )
-                for percentile, q
-                in PERCENTILES.items()
-            }
+        metrics[column] = {
+            label: (
+                float(values.quantile(q))
+                if not values.empty
+                else 0.0
+            )
+            for label, q in PERCENTILES.items()
+        }
 
     return metrics
 
 
-# ============================================================
-# MONTE CARLO
-# ============================================================
-
 def run_monte_carlo(
     model,
-
     simulations=1000,
-
-    # --------------------------------------------------------
-    # Scenario inputs
-    # --------------------------------------------------------
-
     trucks_per_day=None,
-
     arrival_variability=None,
-
-    demand_variability=0.0,
-
+    demand_variability=0.03,
     management_enabled=None,
-
     max_entries_per_hour=None,
-
     seed=42,
-
-    # --------------------------------------------------------
-    # Gate configuration
-    # --------------------------------------------------------
-
     entry_gate_rules=None,
-
     exit_gate_rules=None,
-
     entry_access_rules=None,
-
     gate_lanes=None,
-
-    gate_times_sec=None,
-
-    # --------------------------------------------------------
-    # Road configuration
-    # --------------------------------------------------------
-
-    average_speed_kmh=None,
-
-    lanes_per_direction=None,
-
-    capacity_per_lane_vph=None,
-
-    n2_n1_corridor_lanes=None,
-
-    # --------------------------------------------------------
-    # Routing
-    # --------------------------------------------------------
-
     route_overrides=None,
-
     route_randomization=None,
-
-    # --------------------------------------------------------
-    # Logistics
-    # --------------------------------------------------------
-
     logistics_destination_daily=None,
-
-    # --------------------------------------------------------
-    # Junctions
-    # --------------------------------------------------------
-
-    junctions=None,
-
-    # --------------------------------------------------------
-    # Terminal / cargo
-    # --------------------------------------------------------
-
+    gate_times_sec=None,
+    n2_n1_corridor_lanes=None,
+    lanes_per_direction=None,
+    capacity_per_lane_vph=None,
     terminal_shares=None,
-
     cargo_shares=None,
-
-    # --------------------------------------------------------
-    # Parallelisation
-    # --------------------------------------------------------
-
-    workers=1,
+    workers=None,
+    **kwargs,
 ):
     """
-    Run Monte Carlo simulations using the REAL JIP SimPy model.
+    Fast gate-only Monte Carlo.
 
-    The ONLY KPI calculated is gate congestion.
-
-    Default workers = 2 because Streamlit Cloud has limited
-    resources and each worker executes a complete SimPy model.
+    The `model` argument is retained for dashboard compatibility.
+    main.py is used only as the source of default configuration.
+    No full SimPy/network simulation is executed here.
     """
 
-    # ========================================================
-    # VALIDATION
-    # ========================================================
-
-    simulations = int(
-        simulations
-    )
+    simulations = int(simulations)
 
     if simulations < 1:
         raise ValueError(
-            "simulations must be at least 1"
+            "simulations must be at least 1."
         )
 
-    workers = int(
-        workers
-    )
-
-    if workers < 1:
-        workers = 1
-
-    workers = min(
-        workers,
-        simulations,
-    )
-
-    # ========================================================
-    # READ DEFAULTS FROM main.py
-    # ========================================================
+    # --------------------------------------------------------
+    # Read defaults from main.py
+    # --------------------------------------------------------
 
     if trucks_per_day is None:
-
         trucks_per_day = int(
             model.TRUCK_MOVEMENTS_PER_DAY
         )
 
     if arrival_variability is None:
-
         arrival_variability = float(
             model.ARRIVAL_TIME_RANDOMIZATION
         )
 
     if management_enabled is None:
-
         management_enabled = bool(
             model.APPOINTMENT_MANAGEMENT_ENABLED
         )
 
     if max_entries_per_hour is None:
-
         max_entries_per_hour = int(
             model.MAX_PORT_ENTRIES_PER_HOUR
         )
 
-    if average_speed_kmh is None:
+    if entry_gate_rules is None:
+        entry_gate_rules = model.ENTRY_GATE_RULES
 
-        average_speed_kmh = float(
-            model.AVERAGE_SPEED_KMH
-        )
+    if exit_gate_rules is None:
+        exit_gate_rules = model.EXIT_GATE_RULES
 
-    if lanes_per_direction is None:
+    if entry_access_rules is None:
+        entry_access_rules = model.ENTRY_ACCESS_RULES
 
-        lanes_per_direction = int(
-            model.LANES_PER_DIRECTION
-        )
+    if gate_lanes is None:
+        gate_lanes = model.GATE_LANES
 
-    if capacity_per_lane_vph is None:
+    if gate_times_sec is None:
+        gate_times_sec = model.GATE_TIMES_SEC
 
-        capacity_per_lane_vph = int(
-            model.CAPACITY_PER_LANE_VPH
-        )
+    if terminal_shares is None:
+        terminal_shares = model.TERMINAL_SHARES
 
-    if n2_n1_corridor_lanes is None:
+    if cargo_shares is None:
+        cargo_shares = model.CARGO_SHARES
 
-        n2_n1_corridor_lanes = int(
-            model.N2_N1_CORRIDOR_LANES
-        )
-
-    if route_randomization is None:
-
-        route_randomization = float(
-            model.ROUTE_RANDOMIZATION
-        )
-
-    # ========================================================
-    # FREEZE SCENARIO
-    # ========================================================
-
-    base_entry_rules = deepcopy(
-        entry_gate_rules
-        if entry_gate_rules is not None
-        else model.ENTRY_GATE_RULES
-    )
-
-    base_exit_rules = deepcopy(
-        exit_gate_rules
-        if exit_gate_rules is not None
-        else model.EXIT_GATE_RULES
-    )
-
-    base_access_rules = deepcopy(
-        entry_access_rules
-        if entry_access_rules is not None
-        else model.ENTRY_ACCESS_RULES
-    )
-
-    base_gate_lanes = deepcopy(
-        gate_lanes
-        if gate_lanes is not None
-        else model.GATE_LANES
-    )
-
-    base_gate_times = deepcopy(
-        gate_times_sec
-        if gate_times_sec is not None
-        else model.GATE_TIMES_SEC
-    )
-
-    base_route_overrides = deepcopy(
-        route_overrides
-        if route_overrides is not None
-        else model.ROUTE_OVERRIDES
-    )
-
-    base_logistics_destination = deepcopy(
-        logistics_destination_daily
-        if logistics_destination_daily is not None
-        else model.LOGISTICS_DESTINATION_DAILY
-    )
-
-    base_junctions = deepcopy(
-        junctions
-        if junctions is not None
-        else model.JUNCTIONS
-    )
-
-    base_terminal_shares = deepcopy(
-        terminal_shares
-        if terminal_shares is not None
-        else model.TERMINAL_SHARES
-    )
-
-    base_cargo_shares = deepcopy(
-        cargo_shares
-        if cargo_shares is not None
-        else model.CARGO_SHARES
-    )
-
-    # ========================================================
-    # BUILD IMMUTABLE SCENARIO
-    # ========================================================
+    # --------------------------------------------------------
+    # Freeze configuration
+    # --------------------------------------------------------
 
     scenario = {
-
-        "trucks_per_day":
-            int(trucks_per_day),
-
-        "arrival_variability":
-            float(arrival_variability),
-
-        "demand_variability":
-            float(demand_variability),
-
-        "management_enabled":
-            bool(management_enabled),
-
-        "max_entries_per_hour":
-            int(max_entries_per_hour),
-
-        "average_speed_kmh":
-            float(average_speed_kmh),
-
-        "lanes_per_direction":
-            int(lanes_per_direction),
-
-        "capacity_per_lane_vph":
-            int(capacity_per_lane_vph),
-
-        "n2_n1_corridor_lanes":
-            int(n2_n1_corridor_lanes),
-
-        "route_randomization":
-            float(route_randomization),
-
-        "entry_gate_rules":
-            base_entry_rules,
-
-        "exit_gate_rules":
-            base_exit_rules,
-
-        "entry_access_rules":
-            base_access_rules,
-
-        "gate_lanes":
-            base_gate_lanes,
-
-        "gate_times_sec":
-            base_gate_times,
-
-        "route_overrides":
-            base_route_overrides,
-
-        "logistics_destination_daily":
-            base_logistics_destination,
-
-        "junctions":
-            base_junctions,
-
-        "terminal_shares":
-            base_terminal_shares,
-
-        "cargo_shares":
-            base_cargo_shares,
+        "trucks_per_day": int(
+            trucks_per_day
+        ),
+        "arrival_variability": float(
+            arrival_variability
+        ),
+        "demand_variability": float(
+            demand_variability
+        ),
+        "management_enabled": bool(
+            management_enabled
+        ),
+        "max_entries_per_hour": int(
+            max_entries_per_hour
+        ),
+        "entry_gate_rules": deepcopy(
+            entry_gate_rules
+        ),
+        "exit_gate_rules": deepcopy(
+            exit_gate_rules
+        ),
+        "entry_access_rules": deepcopy(
+            entry_access_rules
+        ),
+        "gate_lanes": deepcopy(
+            gate_lanes
+        ),
+        "gate_times_sec": deepcopy(
+            gate_times_sec
+        ),
+        "terminal_shares": deepcopy(
+            terminal_shares
+        ),
+        "cargo_shares": deepcopy(
+            cargo_shares
+        ),
     }
 
-    # ========================================================
-    # GENERATE INDEPENDENT SEEDS
-    # ========================================================
+    # --------------------------------------------------------
+    # Validate gate rules
+    # --------------------------------------------------------
+
+    gates = list(
+        scenario["gate_lanes"].keys()
+    )
+
+    for gate, cfg in scenario[
+        "gate_lanes"
+    ].items():
+
+        for operation in (
+            "entry",
+            "exit",
+        ):
+            if int(
+                cfg.get(
+                    operation,
+                    0,
+                )
+            ) < 0:
+                raise ValueError(
+                    f"Gate {gate} has negative "
+                    f"{operation} lanes."
+                )
+
+    # --------------------------------------------------------
+    # Independent scenario seeds
+    # --------------------------------------------------------
 
     master_rng = np.random.default_rng(
         int(seed)
@@ -884,127 +895,46 @@ def run_monte_carlo(
         dtype=np.int64,
     )
 
-    tasks = [
-        (
-            simulation_number,
-            int(simulation_seed),
-            scenario,
-        )
-        for simulation_number, simulation_seed
-        in enumerate(
-            seeds,
-            start=1,
-        )
-    ]
-
-    # ========================================================
-    # RUN PARALLEL MONTE CARLO
-    # ========================================================
-
-    context = mp.get_context(
-        "spawn"
-    )
+    # --------------------------------------------------------
+    # Run scenarios
+    #
+    # IMPORTANT:
+    # No ProcessPoolExecutor.
+    #
+    # The simplified model is deliberately lightweight enough
+    # that one Streamlit process can run the full experiment
+    # without spawning multiple copies of main.py.
+    # --------------------------------------------------------
 
     records = []
 
-    try:
+    for simulation_number, simulation_seed in enumerate(
+        seeds,
+        start=1,
+    ):
 
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=context,
-        ) as executor:
+        records.append(
+            _simulate_one_scenario(
+                scenario=scenario,
+                simulation_number=simulation_number,
+                simulation_seed=int(
+                    simulation_seed
+                ),
+            )
+        )
 
-            for result in executor.map(
-                _run_single_simulation,
-                tasks,
-            ):
-
-                # ------------------------------------------------
-                # Worker completed but returned an exception
-                # ------------------------------------------------
-
-                if not result.get(
-                    "ok",
-                    False,
-                ):
-
-                    error_message = (
-                        "\n\n"
-                        "Monte Carlo worker failed.\n"
-                        f"Simulation: "
-                        f"{result.get('simulation')}\n"
-                        f"Seed: "
-                        f"{result.get('seed')}\n"
-                        f"Worker PID: "
-                        f"{result.get('worker_pid')}\n"
-                        f"Error type: "
-                        f"{result.get('error_type')}\n"
-                        f"Error: "
-                        f"{result.get('error')}\n\n"
-                        "Worker traceback:\n"
-                        f"{result.get('traceback')}"
-                    )
-
-                    raise RuntimeError(
-                        error_message
-                    )
-
-                records.append(
-                    result
-                )
-
-    except BrokenProcessPool as exc:
-
-        # ----------------------------------------------------
-        # A worker process disappeared completely.
-        #
-        # This usually means:
-        #   - memory/resource exhaustion
-        #   - native crash
-        #   - process killed by the platform
-        #   - multiprocessing infrastructure failure
-        # ----------------------------------------------------
-
-        raise RuntimeError(
-            "\n\n"
-            "Monte Carlo worker process terminated "
-            "unexpectedly.\n\n"
-            f"Workers used: {workers}\n"
-            f"Simulations requested: {simulations}\n\n"
-            "This is different from a normal Python "
-            "exception inside the model. The worker "
-            "process itself disappeared.\n\n"
-            "Most likely causes on Streamlit Cloud are "
-            "resource / memory pressure when several "
-            "full SimPy simulations run simultaneously.\n\n"
-            "Try workers=1 or workers=2 first. "
-            "If workers=1 works but workers=2 fails, "
-            "the issue is almost certainly parallel "
-            "resource consumption."
-        ) from exc
-
-    # ========================================================
-    # RESULTS DATAFRAME
-    # ========================================================
+    # --------------------------------------------------------
+    # Results
+    # --------------------------------------------------------
 
     df = pd.DataFrame(
         records
     )
 
-    if "simulation" in df.columns:
-
-        df = df.sort_values(
-            "simulation"
-        ).reset_index(
-            drop=True
-        )
-
-    # ========================================================
-    # GATE KPI COLUMNS
-    # ========================================================
-
-    gates = list(
-        base_gate_lanes.keys()
+    df = df.sort_values(
+        "simulation"
+    ).reset_index(
+        drop=True
     )
 
     metric_columns = [
@@ -1016,24 +946,14 @@ def run_monte_carlo(
         "peak_queue_all"
     )
 
-    metric_columns = [
-        column
-        for column in metric_columns
-        if column in df.columns
-    ]
-
-    # ========================================================
-    # PERCENTILES
-    # ========================================================
-
     metrics = _percentile_summary(
         df,
         metric_columns,
     )
 
-    # ========================================================
-    # REPRESENTATIVE SCENARIO
-    # ========================================================
+    # --------------------------------------------------------
+    # Representative scenario
+    # --------------------------------------------------------
 
     representative = {}
 
@@ -1045,88 +965,74 @@ def run_monte_carlo(
             ].median()
         )
 
-        distance = (
+        idx = (
             df[
                 "peak_queue_all"
-            ] - target
-        ).abs()
-
-        idx = int(
-            distance.idxmin()
+            ]
+            .sub(target)
+            .abs()
+            .idxmin()
         )
 
         representative = (
-            df.loc[idx]
+            df.loc[int(idx)]
             .to_dict()
         )
 
-    # ========================================================
-    # GATE CAPACITY METADATA
-    # ========================================================
+    # --------------------------------------------------------
+    # Gate metadata
+    # --------------------------------------------------------
 
     gate_capacities = {}
 
-    for gate, lanes_cfg in (
-        base_gate_lanes.items()
-    ):
+    for gate, cfg in scenario[
+        "gate_lanes"
+    ].items():
 
-        for operation in (
-            "entry",
-            "exit",
-        ):
-
-            key = (
-                f"{gate} "
-                f"{operation.upper()}"
-            )
-
-            lanes = int(
-                lanes_cfg.get(
-                    operation,
+        gate_capacities[
+            f"{gate} ENTRY"
+        ] = {
+            "lanes": int(
+                cfg.get(
+                    "entry",
                     0,
                 )
-            )
+            ),
+            "configured": True,
+        }
 
-            gate_capacities[key] = {
-                "lanes": lanes,
-                "configured": True,
-            }
+        gate_capacities[
+            f"{gate} EXIT"
+        ] = {
+            "lanes": int(
+                cfg.get(
+                    "exit",
+                    0,
+                )
+            ),
+            "configured": True,
+        }
 
-    # ========================================================
-    # RETURN
-    # ========================================================
+    # --------------------------------------------------------
+    # Return dashboard-compatible structure
+    # --------------------------------------------------------
 
     return {
+        "results": df,
 
-        # One row per real SimPy replication
-        "results":
-            df,
+        "metrics": metrics,
 
-        # P10 / P50 / P90 / P95 / P99
-        "metrics":
-            metrics,
-
-        # Actual simulation closest to median
         "representative":
             representative,
 
-        # Static gate information
         "gate_capacities_vph":
             gate_capacities,
 
-        # Empty network metadata kept for dashboard
-        # compatibility.
-        "network_metrics":
-            {},
+        "network_metrics": {},
+        "network_percentiles": {},
 
-        "network_percentiles":
-            {},
-
-        "spillback_metrics":
-            {},
-
-        "spillback_percentiles":
-            {},
+        "spillback_metrics": {},
+        "spillback_percentiles": {},
 
         "queue_metrics":
             metrics,
@@ -1134,13 +1040,15 @@ def run_monte_carlo(
         "queue_percentiles":
             metrics,
 
-        # Configuration used
         "configuration": {
             "simulations":
                 simulations,
 
             "workers":
-                workers,
+                1,
+
+            "model_type":
+                "gate_only",
 
             "trucks_per_day":
                 int(trucks_per_day),
@@ -1159,5 +1067,11 @@ def run_monte_carlo(
 
             "seed":
                 int(seed),
+
+            "roads_simulated":
+                False,
+
+            "junctions_simulated":
+                False,
         },
     }
