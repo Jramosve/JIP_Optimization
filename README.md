@@ -23,7 +23,9 @@ Exit-gate queues now occupy physical storage on the final approach links to G8, 
 The dashboard separately reports gate queue time and exit-gate spillback pressure.
 
 ## Monte Carlo
-The fast Monte Carlo layer keeps scenario daily demand fixed and introduces controlled variability in the hourly demand pattern and flow allocation. It reports P10/P50/P90/P95/P99 for peak gate queue, peak network V/C, spillback and turnaround proxy.
+The fast gate Monte Carlo (`monte_carlo.py`) reproduces the main.py demand generation (terminal split, hourly profile and variability, ELM appointment cap, cargo mix, entry/exit gate allocation, MPT destinations), gate lanes and processing times, and the full truck cycle that feeds the exit gates (entry gate → route → terminal process → route → exit gate). All scenarios of a batch are simulated together with numpy, so 1,000 scenarios of 10,500 trucks run in a few seconds.
+
+It reports P10/P50/P90/P95/P99 of peak gate queue (trucks waiting + in service, sampled every 5 min as in main.py), peak gate queue time and average gate queue time, per gate and operation, next to the value from the current simulation run. Road-link and junction queueing are not simulated, so results only diverge from main.py when the internal network itself is saturated.
 
 ## Run locally
 ```bash
