@@ -26,7 +26,6 @@ import traceback
 
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-)
 
 from copy import deepcopy
 
