@@ -3268,7 +3268,7 @@ def print_summary(
             "marshalling_queue": marshalling_queue_df,
             "graph": graph,
         }
-    finally:
+        finally:
         (
             TRUCK_MOVEMENTS_PER_DAY,
             INTERNAL_MOVEMENTS_PER_DAY,
