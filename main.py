@@ -2812,6 +2812,15 @@ def validate_configuration():
                     raise ValueError(
                         f"{rule_name} {flow} has negative share for {gate}."
                     )
+                if (
+                    rule_name == "EXIT_GATE_RULES"
+                    and share > 0
+                    and int(GATE_LANES.get(gate, {}).get("exit", 0)) <= 0
+                ):
+                    raise ValueError(
+                        f"EXIT_GATE_RULES {flow[0]} {flow[1]} assigns flow to {gate}, "
+                        f"but {gate} has 0 exit lanes configured."
+                    )
 
     for gate, cfg in GATE_LANES.items():
         if int(cfg.get("entry", 0)) < 0 or int(cfg.get("exit", 0)) < 0:

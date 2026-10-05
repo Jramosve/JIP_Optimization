@@ -1,4 +1,5 @@
 import html
+from contextlib import contextmanager
 import random
 import networkx as nx
 import numpy as np
@@ -235,6 +236,20 @@ def queue_to_hex(q):
     if q < 75: return "#e0b100"
     if q < 150: return "#f28c28"
     return "#d64545"
+
+
+@contextmanager
+def report_config_errors(what):
+    """Show configuration errors in the app instead of crashing.
+
+    Streamlit Cloud redacts uncaught exception messages, so the user would
+    otherwise not see what is wrong with the inputs.
+    """
+    try:
+        yield
+    except (ValueError, RuntimeError) as exc:
+        st.error(f"{what} could not run with these inputs:\n\n{exc}")
+        st.stop()
 
 
 def show_html(content, height):
@@ -726,6 +741,14 @@ if mode=="Advanced":
         except Exception as exc:
             flow_errors.append(f"Could not build route editor: {exc}")
 
+# Every gate that receives flow must have lanes for that direction; otherwise
+# the simulation would stop with "Gate ... has no lanes configured".
+for direction,rules,lane_key in [("Entry",entry_rules,"entry"),("Exit",exit_rules,"exit")]:
+    for (terminal,cargo),options in rules.items():
+        for gate,share in options:
+            if share>0 and int(gate_lanes.get(gate,{}).get(lane_key,0))<=0:
+                flow_errors.append(f"{direction} allocation {terminal} {cargo}: {share*100:.0f}% is sent to {gate}, but {gate} has 0 {lane_key} lanes. Change the allocation or add {gate} {'IN' if lane_key=='entry' else 'OUT'} lanes (Advanced mode).")
+
 if flow_errors:
     st.error("Please correct the following inputs before running:\n\n" + "\n".join(flow_errors))
 run_ok=not flow_errors
@@ -744,7 +767,7 @@ if "base_result" not in st.session_state: st.session_state.base_result=None
 if "mc_result" not in st.session_state: st.session_state.mc_result=None
 
 if st.button("Run simulation",type="primary",disabled=not run_ok):
-    with st.spinner("Running JIP traffic simulation..."):
+    with report_config_errors("The simulation"), st.spinner("Running JIP traffic simulation..."):
         st.session_state.result=model.run_simulation(
             trucks_per_day=trucks_per_day,route_randomization=route_randomization_pct/100,
             arrival_time_variability=arrival_time_randomization_pct/100,seed=int(seed),
@@ -894,29 +917,30 @@ mc_share_var_pct=mc2.slider("Terminal / cargo share variability (%)",0,20,0,1,he
 mc3.metric("Hourly profile variability",f"{arrival_time_randomization_pct}%",help="Taken from the sidebar so the Monte Carlo describes the same scenario as the simulation run.")
 if st.button("Run Gate Monte Carlo",disabled=not run_ok):
     progress=st.progress(0.0,text="Running gate-congestion scenarios...")
-    st.session_state.mc_result=monte_carlo.run_monte_carlo(
-        model,
-        int(mc_sims),
-        int(trucks_per_day),
-        arrival_time_randomization_pct/100,
-        mc_share_var_pct/100,
-        management_enabled,
-        int(max_entries),
-        int(seed),
-        entry_access_rules=entry_rules,
-        exit_gate_rules=exit_rules,
-        gate_lanes=gate_lanes,
-        gate_times_sec=gate_times,
-        terminal_shares=terminal_shares,
-        cargo_shares=cargo_shares,
-        average_speed_kmh=average_speed,
-        junctions=junctions,
-        terminal_process_min=terminal_process,
-        route_overrides=route_overrides,
-        route_randomization=route_randomization_pct/100,
-        graph=graph,
-        progress_callback=lambda done,total: progress.progress(done/total,text=f"Running gate-congestion scenarios... {done:,}/{total:,}"),
-    )
+    with report_config_errors("The Monte Carlo"):
+        st.session_state.mc_result=monte_carlo.run_monte_carlo(
+            model,
+            int(mc_sims),
+            int(trucks_per_day),
+            arrival_time_randomization_pct/100,
+            mc_share_var_pct/100,
+            management_enabled,
+            int(max_entries),
+            int(seed),
+            entry_access_rules=entry_rules,
+            exit_gate_rules=exit_rules,
+            gate_lanes=gate_lanes,
+            gate_times_sec=gate_times,
+            terminal_shares=terminal_shares,
+            cargo_shares=cargo_shares,
+            average_speed_kmh=average_speed,
+            junctions=junctions,
+            terminal_process_min=terminal_process,
+            route_overrides=route_overrides,
+            route_randomization=route_randomization_pct/100,
+            graph=graph,
+            progress_callback=lambda done,total: progress.progress(done/total,text=f"Running gate-congestion scenarios... {done:,}/{total:,}"),
+        )
     st.session_state.mc_signature=scenario_signature
     progress.empty()
 
@@ -1047,13 +1071,14 @@ if st.button("Run ELM cap comparison",disabled=not run_ok or not (sweep_caps or 
     progress=st.progress(0.0,text="Comparing ELM caps...")
     rows=[]
     for i,(cap,enabled) in enumerate(options):
-        res=monte_carlo.run_monte_carlo(
-            model,int(sweep_sims),int(trucks_per_day),arrival_time_randomization_pct/100,0.0,
-            enabled,int(cap or max_entries),int(seed),
-            entry_access_rules=entry_rules,exit_gate_rules=exit_rules,gate_lanes=gate_lanes,gate_times_sec=gate_times,
-            terminal_shares=terminal_shares,cargo_shares=cargo_shares,average_speed_kmh=average_speed,
-            junctions=junctions,terminal_process_min=terminal_process,route_overrides=route_overrides,
-            route_randomization=route_randomization_pct/100,graph=graph)
+        with report_config_errors("The ELM cap comparison"):
+            res=monte_carlo.run_monte_carlo(
+                model,int(sweep_sims),int(trucks_per_day),arrival_time_randomization_pct/100,0.0,
+                enabled,int(cap or max_entries),int(seed),
+                entry_access_rules=entry_rules,exit_gate_rules=exit_rules,gate_lanes=gate_lanes,gate_times_sec=gate_times,
+                terminal_shares=terminal_shares,cargo_shares=cargo_shares,average_speed_kmh=average_speed,
+                junctions=junctions,terminal_process_min=terminal_process,route_overrides=route_overrides,
+                route_randomization=route_randomization_pct/100,graph=graph)
         mt=res["metrics"]
         def q(key,p): return float(mt.get(key,{}).get(p,0.0))
         rows.append({
