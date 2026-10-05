@@ -644,7 +644,7 @@ def run_monte_carlo(
     # Parallelisation
     # --------------------------------------------------------
 
-    workers=2,
+    workers=1,
 ):
     """
     Run Monte Carlo simulations using the REAL JIP SimPy model.
