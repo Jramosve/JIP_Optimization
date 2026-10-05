@@ -6,6 +6,7 @@
 import math
 import random
 import re
+import weakref
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -542,23 +543,13 @@ def choose_network_path(graph, start, destination, rng, route_overrides=None):
             )
         return path
 
-    try:
-        generator = nx.shortest_simple_paths(
-            graph, source=start, target=destination, weight="travel_time_min"
-        )
-        candidates = []
-        for path in generator:
-            candidates.append(path)
-            if len(candidates) >= max(1, ROUTE_ALTERNATIVE_COUNT):
-                break
-    except nx.NetworkXNoPath:
-        raise RuntimeError(f"No route found from {start} to {destination}")
+    candidates = _candidate_paths(graph, start, destination)
 
     if len(candidates) == 1 or ROUTE_RANDOMIZATION <= 0:
-        return candidates[0]
+        return list(candidates[0])
 
     if rng.random() >= ROUTE_RANDOMIZATION:
-        return candidates[0]
+        return list(candidates[0])
 
     costs = [
         sum(graph[a][b]["travel_time_min"] for a, b in zip(path[:-1], path[1:]))
@@ -566,7 +557,32 @@ def choose_network_path(graph, start, destination, rng, route_overrides=None):
     ]
     min_cost = min(costs)
     weights = [max(0.05, min_cost / c) for c in costs]
-    return weighted_choice(candidates, weights, rng)
+    return list(weighted_choice(candidates, weights, rng))
+
+
+# k-shortest candidate paths per graph and OD pair. Every truck with the same
+# origin and destination gets the same candidates, so computing them once per
+# run avoids re-running shortest_simple_paths thousands of times.
+_CANDIDATE_PATH_CACHE = weakref.WeakKeyDictionary()
+
+
+def _candidate_paths(graph, start, destination):
+    per_graph = _CANDIDATE_PATH_CACHE.setdefault(graph, {})
+    key = (start, destination, max(1, ROUTE_ALTERNATIVE_COUNT))
+    if key not in per_graph:
+        try:
+            generator = nx.shortest_simple_paths(
+                graph, source=start, target=destination, weight="travel_time_min"
+            )
+            candidates = []
+            for path in generator:
+                candidates.append(tuple(path))
+                if len(candidates) >= key[2]:
+                    break
+        except nx.NetworkXNoPath:
+            raise RuntimeError(f"No route found from {start} to {destination}")
+        per_graph[key] = candidates
+    return per_graph[key]
 
 
 def validate_route_overrides(graph, route_overrides):
@@ -1353,6 +1369,9 @@ def create_trucks(
     if appointment_management_enabled is None: appointment_management_enabled=APPOINTMENT_MANAGEMENT_ENABLED
     if max_entries_per_hour is None: max_entries_per_hour=MAX_PORT_ENTRIES_PER_HOUR
     appointment_df=pd.DataFrame()
+    # Time each truck wanted to enter. With the ELM cap, release is FIFO, so
+    # the i-th scheduled truck is the i-th released truck.
+    scheduled_times=sorted(arrival_times)
     if appointment_management_enabled: arrival_times,appointment_df=apply_entry_appointment_cap(arrival_times,max_entries_per_hour)
     trucks=[]
     for i in range(TRUCK_MOVEMENTS_PER_DAY):
@@ -1361,7 +1380,7 @@ def create_trucks(
         if terminal=="MPT": network_destination=choose_mpt_destination(rng)
         elif terminal=="LOGISTICS": network_destination=destination
         else: network_destination=None
-        trucks.append({"truck_id":f"T{i+1:05d}","arrival_min":arrival_times[i],"terminal":terminal,"cargo":cargo,"entry_gate":entry_gate,"exit_gate":exit_gate,"mpt_destination":network_destination,"network_destination":get_destination_node(terminal,network_destination)})
+        trucks.append({"truck_id":f"T{i+1:05d}","arrival_min":arrival_times[i],"scheduled_arrival_min":scheduled_times[i],"marshalling_wait_min":max(0.0,arrival_times[i]-scheduled_times[i]),"terminal":terminal,"cargo":cargo,"entry_gate":entry_gate,"exit_gate":exit_gate,"mpt_destination":network_destination,"network_destination":get_destination_node(terminal,network_destination)})
     return trucks,appointment_df
 
 
@@ -2157,7 +2176,6 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
     if snapshots.empty:
         return snapshots
 
-    rows = []
     trucks = trucks_df.copy() if isinstance(trucks_df, pd.DataFrame) else pd.DataFrame()
 
     # Pre-compute exit-gate queue eligibility from the completed truck table.
@@ -2174,48 +2192,48 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
                 ["_exit_queue_eligible_min", "sim_finish_min"]
             ].dropna()
 
-    for _, snap in snapshots.iterrows():
-        gate = snap["gate"]
-        operation = snap["operation"]
-        t = float(snap["time_min"])
+    def count_at(values, times):
+        """Number of values <= each time (values need not be sorted)."""
+        return np.searchsorted(np.sort(np.asarray(values, dtype=float)), times, side="right")
+
+    frames = []
+    for (gate, operation), snap in snapshots.groupby(["gate", "operation"], sort=False):
+        snap = snap.copy()
+        t = snap["time_min"].to_numpy(dtype=float)
         g = (
             activities[(activities["gate"] == gate) & (activities["operation"] == operation)]
             if not activities.empty
-            else pd.DataFrame()
+            else pd.DataFrame(columns=["requested_min", "start_min", "finish_min"])
         )
-        requested = int((g["requested_min"] <= t).sum()) if not g.empty else 0
-        finished = int((g["finish_min"] <= t).sum()) if not g.empty else 0
+        requested = count_at(g["requested_min"], t)
+        finished = count_at(g["finish_min"], t)
         # Only trucks whose gate service has started; waiting trucks are
-        # already counted in queue_waiting.
-        in_service = int(
-            ((g["start_min"] <= t) & (g["finish_min"] > t)).sum()
-        ) if not g.empty else 0
+        # already counted in queue_waiting. A finished truck has started,
+        # so started-by-t minus finished-by-t is the number in service.
+        in_service = count_at(g["start_min"], t) - finished
 
         if operation == "EXIT" and gate in exit_queue_lookup:
             qg = exit_queue_lookup[gate]
             # Count trucks that should already have reached the gate under
             # free-flow conditions but have not yet completed the gate.
-            queue_stock = int(
-                (
-                    (qg["_exit_queue_eligible_min"] <= t)
-                    & (qg["sim_finish_min"] > t)
-                ).sum()
+            queue_stock = (
+                count_at(qg["_exit_queue_eligible_min"], t)
+                - count_at(qg["sim_finish_min"], t)
             )
-            queue_waiting = max(0, queue_stock - in_service)
+            queue_waiting = np.maximum(0, queue_stock - in_service)
         else:
-            queue_waiting = int(snap["queue"])
+            queue_waiting = snap["queue"].to_numpy(dtype=int)
             queue_stock = queue_waiting + in_service
 
-        rows.append({
-            **snap.to_dict(),
-            "completed": finished,
-            "requested": requested,
-            "queue_waiting": queue_waiting,
-            "in_service": in_service,
-            "queue_stock": queue_stock,
-        })
+        snap["completed"] = finished
+        snap["requested"] = requested
+        snap["queue_waiting"] = queue_waiting
+        snap["in_service"] = in_service
+        snap["queue_stock"] = queue_stock
+        frames.append(snap)
 
-    return pd.DataFrame(rows)
+    # Keep the original snapshot order.
+    return pd.concat(frames).sort_index().reset_index(drop=True)
 
 
 def build_marshalling_queue_dataframe(appointment_df):

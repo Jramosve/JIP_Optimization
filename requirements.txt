@@ -3,5 +3,5 @@ pandas
 networkx
 simpy
 shapely
-streamlit
-plotly
+streamlit>=1.50
+plotly>=5.24

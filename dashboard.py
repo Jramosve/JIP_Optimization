@@ -237,6 +237,15 @@ def queue_to_hex(q):
     return "#d64545"
 
 
+def show_html(content, height):
+    """Embed the app's own HTML (st.iframe on new Streamlit, components.html before)."""
+    if hasattr(st, "iframe"):
+        st.iframe(content, height=height)
+    else:
+        components.html(content, height=height, scrolling=False)
+
+
+@st.cache_resource(show_spinner=False)
 def build_route_editor_graph():
     routes = model.read_kml_routes()
     return model.build_network(routes)
@@ -329,35 +338,8 @@ def result_kpis(result):
     }
 
 
-def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
-    # Include every graph node, including explicit KML Point nodes that are
-    # not yet connected to a road. This keeps the map aligned with Google Earth.
-    nodes = [
-        (n, float(d["lon"]), float(d["lat"]))
-        for n, d in graph.nodes(data=True)
-        if "lat" in d and "lon" in d
-    ]
-    if not nodes:
-        return "<p>No network coordinates available.</p>"
-
-    geometry_points = []
-    for _, _, data in graph.edges(data=True):
-        geometry_points.extend(data.get("geometry", []))
-    all_points = [(lon, lat) for _, lon, lat in nodes] + geometry_points
-    lons = [p[0] for p in all_points]
-    lats = [p[1] for p in all_points]
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    lon_pad = max((max_lon-min_lon)*0.20, 0.0015)
-    lat_pad = max((max_lat-min_lat)*0.20, 0.0015)
-    min_lon -= lon_pad; max_lon += lon_pad
-    min_lat -= lat_pad; max_lat += lat_pad
-
-    W, H = 1250, 720
-    def xy(lon, lat):
-        return ((lon-min_lon)/(max_lon-min_lon)*W,
-                H-(lat-min_lat)/(max_lat-min_lat)*H)
-
+def network_pressure(graph, road_hourly, queue_stock, hour, gates_df=None):
+    """Per-hour road V/C, gate queues/waits and exit-gate spillback shared by both maps."""
     selected = {}
     if not road_hourly.empty:
         h = road_hourly[road_hourly.hour == hour]
@@ -422,6 +404,49 @@ def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
             visual_group_spill[group_name] = any(
                 physical in spillback_links for physical in members_physical
             )
+
+    return {
+        "selected": selected, "gate_q": gate_q, "gate_wait": gate_wait,
+        "spillback_links": spillback_links,
+        "physical_to_visual_group": physical_to_visual_group,
+        "visual_group_vc": visual_group_vc, "visual_group_spill": visual_group_spill,
+    }
+
+
+def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
+    # Include every graph node, including explicit KML Point nodes that are
+    # not yet connected to a road. This keeps the map aligned with Google Earth.
+    nodes = [
+        (n, float(d["lon"]), float(d["lat"]))
+        for n, d in graph.nodes(data=True)
+        if "lat" in d and "lon" in d
+    ]
+    if not nodes:
+        return "<p>No network coordinates available.</p>"
+
+    geometry_points = []
+    for _, _, data in graph.edges(data=True):
+        geometry_points.extend(data.get("geometry", []))
+    all_points = [(lon, lat) for _, lon, lat in nodes] + geometry_points
+    lons = [p[0] for p in all_points]
+    lats = [p[1] for p in all_points]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    lon_pad = max((max_lon-min_lon)*0.20, 0.0015)
+    lat_pad = max((max_lat-min_lat)*0.20, 0.0015)
+    min_lon -= lon_pad; max_lon += lon_pad
+    min_lat -= lat_pad; max_lat += lat_pad
+
+    W, H = 1250, 720
+    def xy(lon, lat):
+        return ((lon-min_lon)/(max_lon-min_lon)*W,
+                H-(lat-min_lat)/(max_lat-min_lat)*H)
+
+    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df)
+    selected, gate_q, gate_wait = state["selected"], state["gate_q"], state["gate_wait"]
+    spillback_links = state["spillback_links"]
+    physical_to_visual_group = state["physical_to_visual_group"]
+    visual_group_vc, visual_group_spill = state["visual_group_vc"], state["visual_group_spill"]
 
     road_svg = []
     seen = set()
@@ -492,6 +517,120 @@ def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
     <span style="color:#d73027">E 0.64–1.00</span><span style="color:#7f1d1d">F &gt;1.00 / congestion</span>
     <span>Gate circles = queue stock</span><span>Gate tooltip = queue time</span></div></div>'''
 
+MAP_BACKGROUNDS = {
+    "Satellite": {
+        "style": "white-bg",
+        "layers": [{
+            "below": "traces",
+            "sourcetype": "raster",
+            "sourceattribution": "Imagery © Esri, Maxar, Earthstar Geographics",
+            "source": ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        }],
+    },
+    "Street map": {"style": "carto-positron", "layers": []},
+    "Dark street map": {"style": "carto-darkmatter", "layers": []},
+}
+
+LOS_COLORS = {"A":"#5caf3a","B":"#9ac34a","C":"#f0a23a","D":"#e76f2f","E":"#d73027","F":"#7f1d1d"}
+
+
+def build_network_figure(graph, road_hourly, queue_stock, hour, gates_df=None, background="Satellite"):
+    """Interactive network map on a real basemap (satellite or street tiles)."""
+    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df)
+    selected, gate_q, gate_wait = state["selected"], state["gate_q"], state["gate_wait"]
+    spillback_links = state["spillback_links"]
+    group_of, group_vc = state["physical_to_visual_group"], state["visual_group_vc"]
+    group_spill = state["visual_group_spill"]
+
+    fig = go.Figure()
+    lons, lats = [], []
+    seen = set()
+    for a, b, data in graph.edges(data=True):
+        physical = data["physical_road"]
+        if physical in seen or not data.get("geometry"):
+            continue
+        seen.add(physical)
+        vc = selected.get(physical, 0.0)
+        group = group_of.get(physical)
+        display_vc = group_vc.get(group, vc)
+        los = los_from_vc(display_vc)
+        color, width = LOS_COLORS[los], (7 if display_vc > 1 else 5)
+        text = f"<b>{html.escape(data.get('kml_name', physical))}</b><br>Segment V/C {vc:.2f} · LOS {los}"
+        if group:
+            text += f"<br>Corridor V/C {display_vc:.2f}"
+        if physical in spillback_links:
+            q, storage, gate = spillback_links[physical]
+            color, width = "#ff2d2d", 9
+            text += f"<br><b>SPILLBACK at {gate}</b>: {q:.0f} trucks > {storage:.0f} storage"
+        elif group and group_spill.get(group, False):
+            text += "<br>G8 approach corridor spillback"
+        g_lon = [p[0] for p in data["geometry"]]
+        g_lat = [p[1] for p in data["geometry"]]
+        lons += g_lon; lats += g_lat
+        fig.add_trace(go.Scattermap(
+            lon=g_lon, lat=g_lat, mode="lines", line=dict(color=color, width=width),
+            hovertext=text, hoverinfo="text", showlegend=False,
+        ))
+
+    gate_set = set(GATES)
+    terminal_set = {"RSGT", "DPW", "MPT1", "MPT2", "MPT3", "Logipoint", "CMA CGM", "Bahri Logistics"}
+    groups = {"Gates": [], "Junctions": [], "Terminals": [], "Other nodes": []}
+    for node, d in graph.nodes(data=True):
+        if "lat" not in d or "lon" not in d:
+            continue
+        lons.append(float(d["lon"])); lats.append(float(d["lat"]))
+        if node in gate_set:
+            q = gate_q.get(node, 0.0)
+            avg_w, peak_w = gate_wait.get(node, (0.0, 0.0))
+            groups["Gates"].append((node, d, queue_to_hex(q), 14 + min(q / 20.0, 16),
+                                    f"<b>{node}</b><br>Queue {q:.0f} trucks<br>Avg wait {avg_w:.1f} min · peak {peak_w:.1f} min"))
+        elif node in JUNCTIONS:
+            groups["Junctions"].append((node, d, "#a78bfa", 11, f"<b>{node}</b><br>Junction"))
+        elif node in terminal_set:
+            groups["Terminals"].append((node, d, "#60a5fa", 11, f"<b>{html.escape(node)}</b><br>Terminal / destination"))
+        else:
+            groups["Other nodes"].append((node, d, "#9aa3ad", 8, html.escape(node)))
+
+    for name, items in groups.items():
+        if not items:
+            continue
+        fig.add_trace(go.Scattermap(
+            lon=[float(i[1]["lon"]) for i in items], lat=[float(i[1]["lat"]) for i in items],
+            mode="markers+text", text=[i[0] for i in items], textposition="top right",
+            textfont=dict(size=12, color="#ffffff" if background != "Street map" else "#111827"),
+            marker=dict(size=[i[3] for i in items], color=[i[2] for i in items]),
+            hovertext=[i[4] for i in items], hoverinfo="text", name=name, showlegend=False,
+        ))
+
+    # Legend: LOS bands and gate queue classes (identity is never colour-only:
+    # every road and gate also carries its value in the tooltip).
+    for los, label in [("A","≤0.15"),("B","0.15–0.27"),("C","0.27–0.43"),("D","0.43–0.64"),("E","0.64–1.00"),("F",">1.00")]:
+        fig.add_trace(go.Scattermap(lon=[None], lat=[None], mode="lines", line=dict(color=LOS_COLORS[los], width=5),
+                                    name=f"LOS {los}  V/C {label}", legendgroup="los", legendgrouptitle_text="Road V/C"))
+    for color, label in [("#22a06b","< 25"),("#e0b100","25–75"),("#f28c28","75–150"),("#d64545","≥ 150")]:
+        fig.add_trace(go.Scattermap(lon=[None], lat=[None], mode="markers", marker=dict(size=12, color=color),
+                                    name=f"{label} trucks", legendgroup="gate", legendgrouptitle_text="Gate queue"))
+
+    min_lon, max_lon, min_lat, max_lat = min(lons), max(lons), min(lats), max(lats)
+    span_lon = max((max_lon - min_lon) * 1.25, 0.002)
+    span_lat = max((max_lat - min_lat) * 1.25, 0.002)
+    height = 680
+    # Web-mercator zoom that fits the network in ~1000 x height pixels.
+    zoom = min(np.log2(1000 * 360 / (256 * span_lon)),
+               np.log2(height * 360 / (256 * span_lat / np.cos(np.radians((min_lat + max_lat) / 2)))))
+    bg = MAP_BACKGROUNDS[background]
+    fig.update_layout(
+        height=height, margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="#12161c", font=dict(color="#f2f4f7"),
+        map=dict(style=bg["style"], layers=bg["layers"],
+                 center=dict(lon=(min_lon + max_lon) / 2, lat=(min_lat + max_lat) / 2), zoom=float(zoom)),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(18,22,28,0.85)", bordercolor="#2a3038", borderwidth=1,
+                    font=dict(size=11), groupclick="toggleitem"),
+        hoverlabel=dict(bgcolor="#12161c", font=dict(color="#f2f4f7")),
+    )
+    return fig
+
+
 with st.sidebar:
     st.header("Scenario")
     mode=st.radio("Mode",["Basic","Advanced"],horizontal=True)
@@ -539,22 +678,22 @@ flow_errors=[]
 fc1,fc2=st.columns(2)
 with fc1:
     st.subheader("Terminal split")
-    ts=st.data_editor(terminal_share_df(model.TERMINAL_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Share (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="terminal_share_editor")
+    ts=st.data_editor(terminal_share_df(model.TERMINAL_SHARES),width="stretch",num_rows="fixed",hide_index=True,column_config={"Share (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="terminal_share_editor")
     terminal_shares,err=df_to_terminal_shares(ts); flow_errors+=err
 with fc2:
     st.subheader("Full / Empty split")
-    cs=st.data_editor(cargo_share_df(model.CARGO_SHARES),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Full (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1),"Empty (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="cargo_share_editor")
+    cs=st.data_editor(cargo_share_df(model.CARGO_SHARES),width="stretch",num_rows="fixed",hide_index=True,column_config={"Full (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1),"Empty (%)":st.column_config.NumberColumn(min_value=0,max_value=100,step=1)},key="cargo_share_editor")
     cargo_shares,err=df_to_cargo_shares(cs); flow_errors+=err
 
 st.subheader("Gate allocation")
 col1,col2=st.columns(2)
 with col1:
     st.caption("Entry allocation — terminal × cargo. Each row must sum to 100%.")
-    ed=st.data_editor(access_rules_to_df(model.ENTRY_ACCESS_RULES),use_container_width=True,num_rows="fixed",column_config={g:st.column_config.NumberColumn(g,min_value=0,max_value=100,step=5) for g in GATES},key="entry_access_editor")
+    ed=st.data_editor(access_rules_to_df(model.ENTRY_ACCESS_RULES),width="stretch",num_rows="fixed",column_config={g:st.column_config.NumberColumn(g,min_value=0,max_value=100,step=5) for g in GATES},key="entry_access_editor")
     entry_rules,entry_errors=df_to_access_rules(ed); flow_errors+=entry_errors
 with col2:
     st.caption("Exit allocation — terminal × cargo. Each row must sum to 100%.")
-    xd=st.data_editor(rules_to_df(model.EXIT_GATE_RULES),use_container_width=True,num_rows="fixed",column_config={g:st.column_config.NumberColumn(g,min_value=0,max_value=100,step=5) for g in GATES},key="exit_editor")
+    xd=st.data_editor(rules_to_df(model.EXIT_GATE_RULES),width="stretch",num_rows="fixed",column_config={g:st.column_config.NumberColumn(g,min_value=0,max_value=100,step=5) for g in GATES},key="exit_editor")
     exit_rules,exit_errors=df_to_rules(xd); flow_errors+=exit_errors
 
 if mode=="Advanced":
@@ -562,11 +701,11 @@ if mode=="Advanced":
     tc1,tc2=st.columns(2)
     with tc1:
         st.caption("Gate processing — independent of terminal.")
-        gt=st.data_editor(gate_service_df(),use_container_width=True,num_rows="fixed",column_config={"Processing time (sec)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1)},key="gate_service_times_editor")
+        gt=st.data_editor(gate_service_df(),width="stretch",num_rows="fixed",column_config={"Processing time (sec)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1)},key="gate_service_times_editor")
         gate_times=df_to_gate_service_times(gt)
     with tc2:
         st.caption("Terminal processing — same Full/Empty time by terminal unless edited.")
-        tp=st.data_editor(terminal_process_df(model.TERMINAL_PROCESS_MIN),use_container_width=True,num_rows="fixed",hide_index=True,column_config={"Full (min)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1),"Empty (min)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1)},key="terminal_process_editor")
+        tp=st.data_editor(terminal_process_df(model.TERMINAL_PROCESS_MIN),width="stretch",num_rows="fixed",hide_index=True,column_config={"Full (min)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1),"Empty (min)":st.column_config.NumberColumn(min_value=1,max_value=300,step=1)},key="terminal_process_editor")
         terminal_process= df_to_terminal_process(tp)
 else:
     gate_times=dict(model.GATE_TIMES_SEC); terminal_process={k:dict(v) for k,v in model.TERMINAL_PROCESS_MIN.items()}
@@ -581,7 +720,7 @@ if mode=="Advanced":
     with st.expander("Internal route configuration",expanded=False):
         try:
             editor_graph=build_route_editor_graph(); route_defaults=configured_od_rows(editor_graph,entry_rules,exit_rules)
-            route_editor=st.data_editor(route_defaults[["Direction","Flow","OD","Path","Valid"]],use_container_width=True,hide_index=True,disabled=["Direction","Flow","OD","Valid"],column_config={"Path":st.column_config.TextColumn("Path (editable)",width="large"),"Valid":st.column_config.CheckboxColumn("Valid",disabled=True)},key="route_editor")
+            route_editor=st.data_editor(route_defaults[["Direction","Flow","OD","Path","Valid"]],width="stretch",hide_index=True,disabled=["Direction","Flow","OD","Valid"],column_config={"Path":st.column_config.TextColumn("Path (editable)",width="large"),"Valid":st.column_config.CheckboxColumn("Valid",disabled=True)},key="route_editor")
             route_overrides,route_errors=parse_route_overrides(route_editor.assign(_key=route_defaults.loc[route_editor.index,"_key"].values),editor_graph)
             flow_errors+=route_errors
         except Exception as exc:
@@ -593,7 +732,7 @@ run_ok=not flow_errors
 
 # Inputs shared by the simulation run and the gate Monte Carlo. Used to flag
 # when the Monte Carlo is compared against a run made with other inputs.
-scenario_signature=repr((int(trucks_per_day),arrival_time_randomization_pct,bool(management_enabled),int(max_entries),
+scenario_signature=repr((int(trucks_per_day),arrival_time_randomization_pct,route_randomization_pct,bool(management_enabled),int(max_entries),
     sorted(entry_rules.items()),sorted(exit_rules.items()),sorted((g,sorted(v.items())) for g,v in gate_lanes.items()),
     sorted(gate_times.items()),sorted(terminal_shares.items()),sorted((k,sorted(v.items())) for k,v in cargo_shares.items()),
     float(average_speed),sorted((k,sorted(v.items())) for k,v in junctions.items()),
@@ -651,17 +790,70 @@ kpi_values=[("Daily gate truck movements",f"{len(trucks):,}"),("Internal movemen
 for col,(label,value) in zip(c,kpi_values): col.metric(label,value)
 
 if management_enabled and not appointment.empty:
-    st.subheader("Appointment management")
-    st.dataframe(appointment,use_container_width=True)
-    st.caption("Uncovered demand is the demand that could not be released through the port-wide appointment cap and is carried into the next hour.")
+    st.subheader("Appointment management — external marshalling area")
+    st.caption("Trucks that cannot get an ELM appointment in their scheduled hour wait in the external marshalling area (outside JIP) and are released FIFO in the following hours. They are not part of any gate queue.")
+    if "scheduled_arrival_min" in trucks.columns:
+        scheduled_sorted=np.sort(trucks.scheduled_arrival_min.to_numpy())
+        released_sorted=np.sort(trucks.arrival_min.to_numpy())
+        marshalling_wait=trucks.marshalling_wait_min
+    else:
+        scheduled_sorted=released_sorted=np.sort(trucks.arrival_min.to_numpy())
+        marshalling_wait=pd.Series(0.0,index=trucks.index)
+    m_times=np.arange(0.0,float(released_sorted[-1])+60.0,5.0)
+    m_queue=monte_carlo.marshalling_profile(scheduled_sorted,released_sorted,m_times)
+    peak_idx=int(np.argmax(m_queue))
+    delayed=marshalling_wait>0.01
+    last_entry=float(released_sorted[-1])
+    def hhmm(minutes):
+        return f"{int(minutes//60):02d}:{int(minutes%60):02d}"+(" (+1 day)" if minutes>=24*60 else "")
+    mk=st.columns(6)
+    mk[0].metric("Peak marshalling queue",f"{int(m_queue.max()):,} trucks",f"at {hhmm(m_times[peak_idx])}",delta_color="off")
+    mk[1].metric("Trucks delayed",f"{int(delayed.sum()):,}",f"{delayed.mean()*100:.0f}% of demand",delta_color="off")
+    mk[2].metric("Avg wait (delayed trucks)",f"{marshalling_wait[delayed].mean() if delayed.any() else 0.0:.0f} min")
+    mk[3].metric("Max wait",f"{marshalling_wait.max():.0f} min")
+    mk[4].metric("Truck-hours waiting",f"{marshalling_wait.sum()/60:,.0f} h")
+    mk[5].metric("Last port entry",hhmm(last_entry))
+    if last_entry>=24*60:
+        st.warning(f"The ELM cap of {int(max_entries):,} entries/hour cannot release the daily demand within 24 h: the backlog is only cleared at {hhmm(last_entry)}.")
+
+    ap=appointment.copy()
+    fig_ap=go.Figure()
+    fig_ap.add_trace(go.Bar(x=ap.hour,y=ap.scheduled_demand,name="Scheduled demand",marker_color="#7c8ea3",
+                            hovertemplate="%{x}:00 — scheduled %{y:,} trucks<extra></extra>"))
+    fig_ap.add_trace(go.Bar(x=ap.hour,y=ap.released_entries,name="Released entries",marker_color="#4f8cff",
+                            hovertemplate="%{x}:00 — released %{y:,} trucks<extra></extra>"))
+    fig_ap.add_hline(y=int(max_entries),line_dash="dash",line_color="#f2f4f7",line_width=1.5,
+                     annotation_text=f"ELM cap {int(max_entries):,}/h",annotation_position="top left",annotation_font_color="#f2f4f7")
+    fig_ap.update_layout(height=300,barmode="group",bargap=0.25,bargroupgap=0.08,margin=dict(l=20,r=20,t=30,b=20),
+                         paper_bgcolor="#12161c",plot_bgcolor="#12161c",font=dict(color="#f2f4f7"),
+                         title=dict(text="Hourly demand vs ELM releases",font=dict(size=14)),
+                         legend=dict(orientation="h",y=1.12,x=1,xanchor="right"),
+                         xaxis=dict(title="Hour",gridcolor="#2a3038",dtick=2),yaxis=dict(title="Trucks / hour",gridcolor="#2a3038"))
+    st.plotly_chart(fig_ap,width="stretch",config={"displaylogo":False})
+
+    fig_mq=go.Figure(go.Scatter(x=m_times/60.0,y=m_queue,mode="lines",line=dict(color="#f0a23a",width=2),
+                                fill="tozeroy",fillcolor="rgba(240,162,58,0.18)",name="Marshalling queue",
+                                hovertemplate="%{x:.2f} h — %{y:,} trucks waiting<extra></extra>"))
+    fig_mq.add_vline(x=hour+0.5,line_color="#9aa3ad",line_dash="dot",annotation_text=f"Selected hour {hour:02d}:00",annotation_font_color="#9aa3ad")
+    fig_mq.update_layout(height=280,margin=dict(l=20,r=20,t=30,b=20),showlegend=False,
+                         paper_bgcolor="#12161c",plot_bgcolor="#12161c",font=dict(color="#f2f4f7"),
+                         title=dict(text="Trucks waiting in the marshalling area",font=dict(size=14)),
+                         xaxis=dict(title="Hour",gridcolor="#2a3038",dtick=2),yaxis=dict(title="Trucks",gridcolor="#2a3038",rangemode="tozero"))
+    st.plotly_chart(fig_mq,width="stretch",config={"displaylogo":False})
+    with st.expander("Hourly appointment table"):
+        st.dataframe(appointment,width="stretch",hide_index=True)
 
 st.subheader("Exit-gate spillback")
 if not spillback.empty:
-    st.dataframe(spillback,use_container_width=True,hide_index=True)
+    st.dataframe(spillback,width="stretch",hide_index=True)
     st.caption("Approach storage represents the approximate physical truck storage on the final exit-gate approach link. When full, upstream junctions can be held by queued exit traffic, reproducing spillback into the internal road network.")
 
 st.subheader("Network congestion map")
-components.html(build_network_map(graph,road_hourly,queue_stock,hour,gates),height=690,scrolling=False)
+map_background=st.radio("Map background",[*MAP_BACKGROUNDS,"Schematic"],horizontal=True,key="map_background",help="Satellite and street tiles load from Esri / CARTO in your browser and need internet access. Schematic is the offline diagram.")
+if map_background=="Schematic":
+    show_html(build_network_map(graph,road_hourly,queue_stock,hour,gates),height=690)
+else:
+    st.plotly_chart(build_network_figure(graph,road_hourly,queue_stock,hour,gates,map_background),width="stretch",config={"displaylogo":False,"scrollZoom":True})
 st.caption("Road colours use the V/C LOS bands from the provided reference table as a screening classification: A/B/C/D/E/F = ≤0.15 / 0.27 / 0.43 / 0.64 / 1.00 / >1.00. The model capacity itself remains the explicit lane-capacity assumption; the reference table is not used to extrapolate capacity from 60 km/h to 30 km/h. Gate circles represent queue stock. IN and OUT gate lanes are separate resources.")
 
 if st.session_state.base_result is not None:
@@ -672,12 +864,12 @@ if st.session_state.base_result is not None:
         b=base_k[key]; v=scen_k[key]; delta=v-b
         rows.append({"KPI":key,"Base":b,"Scenario":v,"Δ":delta})
     comp=pd.DataFrame(rows)
-    st.dataframe(comp,use_container_width=True,hide_index=True,column_config={"Base":st.column_config.NumberColumn(format="%.2f"),"Scenario":st.column_config.NumberColumn(format="%.2f"),"Δ":st.column_config.NumberColumn(format="%+.2f")})
+    st.dataframe(comp,width="stretch",hide_index=True,column_config={"Base":st.column_config.NumberColumn(format="%.2f"),"Scenario":st.column_config.NumberColumn(format="%.2f"),"Δ":st.column_config.NumberColumn(format="%+.2f")})
 
 
 st.subheader("Configured truck paths")
 path_cols=[c for c in ["truck_id","terminal","cargo","entry_gate","network_destination","entry_path","exit_gate","exit_path"] if c in trucks.columns]
-st.dataframe(trucks[path_cols].head(200),use_container_width=True)
+st.dataframe(trucks[path_cols].head(200),width="stretch")
 st.caption("This table validates the actual route used by each simulated truck. Internal road capacity is assessed separately through the directional V/C results below.")
 
 st.subheader("Gate queue profile")
@@ -689,12 +881,13 @@ qp.columns=[f"{gate} {operation}" for gate,operation in qp.columns]
 st.line_chart(qp)
 st.subheader("Gate queue time by access point")
 wait_df=gate_wait_summary(gates)
-st.dataframe(wait_df,use_container_width=True,hide_index=True)
+st.dataframe(wait_df,width="stretch",hide_index=True)
 st.caption("Gate queue stock includes trucks waiting at the gate and trucks delayed on the upstream road while serving that gate; the same truck is counted only once. Queue time is the simulated waiting time before gate processing and is separate from gate processing time and terminal turnaround.")
 
 
 st.subheader("Monte Carlo — Gate congestion")
 st.caption("Fast gate model: reproduces main.py demand, hourly profile, ELM appointment cap, cargo mix, gate allocation, gate lanes and processing times, and the truck cycle (entry gate → route → terminal → route → exit gate). Road-link and junction queueing are not simulated, so results can diverge from the full simulation only when the internal network itself is saturated.")
+st.caption("Inputs used by the Monte Carlo: demand, hourly variability, route randomization, seed, ELM cap, terminal and Full/Empty split, entry/exit gate allocation, gate lanes, gate and terminal processing times, average speed, junction capacity and manoeuvre delay (as fixed crossing time), and route overrides. Road lanes / capacity per lane and the N4–N2 corridor lanes only affect road congestion and are used by the full simulation only.")
 mc1,mc2,mc3=st.columns(3)
 mc_sims=mc1.number_input("Number of Monte Carlo scenarios",100,20000,1000,100)
 mc_share_var_pct=mc2.slider("Terminal / cargo share variability (%)",0,20,0,1,help="0% = same terminal and Full/Empty shares as the simulation run; variability then comes only from the hourly profile and random cargo/gate choices, exactly as in main.py.")
@@ -720,6 +913,7 @@ if st.button("Run Gate Monte Carlo",disabled=not run_ok):
         junctions=junctions,
         terminal_process_min=terminal_process,
         route_overrides=route_overrides,
+        route_randomization=route_randomization_pct/100,
         graph=graph,
         progress_callback=lambda done,total: progress.progress(done/total,text=f"Running gate-congestion scenarios... {done:,}/{total:,}"),
     )
@@ -751,20 +945,32 @@ if mc:
     run_values["peak_queue_all"]=max(v for k,v in run_values.items() if k.startswith("peak_queue_"))
     run_values["avg_wait_all"]=float(gates.wait_min.mean()) if not gates.empty else 0.0
     run_values["peak_wait_all"]=float(gates.wait_min.max()) if not gates.empty else 0.0
+    if "scheduled_arrival_min" in trucks.columns:
+        rw=trucks.marshalling_wait_min
+        r_sched=np.sort(trucks.scheduled_arrival_min.to_numpy()); r_rel=np.sort(trucks.arrival_min.to_numpy())
+        run_values["peak_marshalling_queue"]=float(monte_carlo.marshalling_profile(r_sched,r_rel,np.arange(0.0,r_rel[-1]+60.0,5.0)).max())
+        run_values["avg_marshalling_wait"]=float(rw.mean())
+        run_values["peak_marshalling_wait"]=float(rw.max())
+        run_values["marshalling_truck_hours"]=float(rw.sum()/60.0)
 
     st.caption(f'{cfg_mc.get("simulations",0):,} scenarios · {cfg_mc.get("trucks_per_day",0):,} trucks/day · hourly variability {cfg_mc.get("arrival_variability",0)*100:.0f}% · share variability {cfg_mc.get("demand_variability",0)*100:.0f}% · ELM cap {"on, "+format(cfg_mc.get("max_entries_per_hour",0),",")+"/h" if cfg_mc.get("management_enabled") else "off"}')
 
-    for title,key,unit,fmt in [("Peak gate queue — all gates","peak_queue_all","trucks","{:.0f}"),("Peak gate queue time","peak_wait_all","min","{:.1f}"),("Average gate queue time","avg_wait_all","min","{:.1f}")]:
+    kpi_rows=[("Peak gate queue — all gates","peak_queue_all","trucks","{:.0f}"),("Peak gate queue time","peak_wait_all","min","{:.1f}"),("Average gate queue time","avg_wait_all","min","{:.1f}")]
+    if cfg_mc.get("management_enabled"):
+        kpi_rows+=[("Peak marshalling-area queue","peak_marshalling_queue","trucks","{:.0f}"),("Max marshalling-area wait","peak_marshalling_wait","min","{:.0f}"),("Truck-hours in marshalling area","marshalling_truck_hours","h","{:,.0f}")]
+    for title,key,unit,fmt in kpi_rows:
         st.markdown(f"**{title}**")
         cols=st.columns(6)
         vals=m.get(key,{})
         for i,label in enumerate(percentile_labels):
             cols[i].metric(label,f"{fmt.format(float(vals.get(label,0.0)))} {unit}")
-        cols[5].metric("Simulation run",f"{fmt.format(run_values[key])} {unit}")
+        cols[5].metric("Simulation run",f"{fmt.format(run_values[key])} {unit}" if key in run_values else "—")
 
     st.subheader("Gate percentiles vs simulation run")
     summary_rows=[]
     dist_options={"All gates — Peak queue (trucks)":"peak_queue_all","All gates — Peak queue time (min)":"peak_wait_all","All gates — Avg queue time (min)":"avg_wait_all"}
+    if cfg_mc.get("management_enabled"):
+        dist_options.update({"Marshalling area — Peak queue (trucks)":"peak_marshalling_queue","Marshalling area — Max wait (min)":"peak_marshalling_wait","Marshalling area — Truck-hours waiting":"marshalling_truck_hours"})
     for g in GATES:
         for op in ["ENTRY","EXIT"]:
             lanes=int(gate_lanes.get(g,{}).get(op.lower(),0))
@@ -776,7 +982,7 @@ if mc:
                 summary_rows.append({"Gate":f"{g} {op}","Lanes":lanes,"Metric":metric_name,
                                      **{p:float(vals.get(p,0.0)) for p in percentile_labels},
                                      "Simulation run":run_values.get(col,0.0)})
-    st.dataframe(pd.DataFrame(summary_rows),use_container_width=True,hide_index=True,
+    st.dataframe(pd.DataFrame(summary_rows),width="stretch",hide_index=True,
                  column_config={c:st.column_config.NumberColumn(format="%.1f") for c in percentile_labels+["Simulation run"]})
     st.caption("Queue = trucks waiting plus in service at the gate (same definition as the gate queue profile above). The simulation run is a single realisation and is expected to fall inside the P10–P90 band most of the time.")
 
@@ -817,7 +1023,7 @@ if mc:
             yaxis=dict(title="Frequency",gridcolor="#2a3038",zeroline=False),
             bargap=0.05,showlegend=False,
         )
-        st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False})
+        st.plotly_chart(fig,width="stretch",config={"displaylogo":False})
 
         pct_df=pd.DataFrame({"Percentile":list(percentiles.keys()),"Value":list(percentiles.values())})
         export_cols=[c for c in ["simulation","daily_demand",value_col] if c in results.columns]
@@ -828,6 +1034,54 @@ if mc:
         d3.download_button("Download percentile summary",pct_df.to_csv(index=False).encode("utf-8"),"jeddah_monte_carlo_gate_percentiles.csv","text/csv",key="download_mc_percentiles")
     else:
         st.info(f"No Monte Carlo results are available for {selected_label}.")
+
+st.subheader("ELM cap comparison")
+st.caption("Runs the gate Monte Carlo for several ELM caps with the current scenario inputs. A lower cap moves waiting from the gates into the external marshalling area; this shows that trade-off.")
+sw1,sw2=st.columns([3,1])
+sweep_caps=sw1.multiselect("ELM caps to compare (entries / hour)",[300,350,400,450,500,550,600,700,800,1000,1200],default=[400,500,600,800],key="sweep_caps")
+sweep_include_nocap=sw1.checkbox("Include 'no cap'",value=True,key="sweep_nocap")
+sweep_sims=sw2.number_input("Scenarios per cap",100,5000,300,100,key="sweep_sims")
+if "sweep_result" not in st.session_state: st.session_state.sweep_result=None
+if st.button("Run ELM cap comparison",disabled=not run_ok or not (sweep_caps or sweep_include_nocap)):
+    options=[(c,True) for c in sorted(sweep_caps)]+([(None,False)] if sweep_include_nocap else [])
+    progress=st.progress(0.0,text="Comparing ELM caps...")
+    rows=[]
+    for i,(cap,enabled) in enumerate(options):
+        res=monte_carlo.run_monte_carlo(
+            model,int(sweep_sims),int(trucks_per_day),arrival_time_randomization_pct/100,0.0,
+            enabled,int(cap or max_entries),int(seed),
+            entry_access_rules=entry_rules,exit_gate_rules=exit_rules,gate_lanes=gate_lanes,gate_times_sec=gate_times,
+            terminal_shares=terminal_shares,cargo_shares=cargo_shares,average_speed_kmh=average_speed,
+            junctions=junctions,terminal_process_min=terminal_process,route_overrides=route_overrides,
+            route_randomization=route_randomization_pct/100,graph=graph)
+        mt=res["metrics"]
+        def q(key,p): return float(mt.get(key,{}).get(p,0.0))
+        rows.append({
+            "ELM cap":f"{cap:,}/h" if cap else "No cap","_cap":cap or 10**9,
+            "Peak gate queue P50":q("peak_queue_all","P50"),"Peak gate queue P90":q("peak_queue_all","P90"),
+            "Peak gate wait P50 (min)":q("peak_wait_all","P50"),"Peak gate wait P90 (min)":q("peak_wait_all","P90"),
+            "Peak marshalling queue P50":q("peak_marshalling_queue","P50"),"Peak marshalling queue P90":q("peak_marshalling_queue","P90"),
+            "Max marshalling wait P90 (min)":q("peak_marshalling_wait","P90"),
+            "Marshalling truck-hours P50":q("marshalling_truck_hours","P50"),
+            "Last entry P90 (h)":q("last_entry_hour","P90"),
+        })
+        progress.progress((i+1)/len(options),text=f"Comparing ELM caps... {i+1}/{len(options)}")
+    progress.empty()
+    st.session_state.sweep_result=pd.DataFrame(rows).sort_values("_cap")
+
+sweep=st.session_state.sweep_result
+if sweep is not None and not sweep.empty:
+    st.dataframe(sweep.drop(columns="_cap"),width="stretch",hide_index=True,
+                 column_config={c:st.column_config.NumberColumn(format="%.0f") for c in sweep.columns if c not in ("ELM cap","_cap","Last entry P90 (h)")}|{"Last entry P90 (h)":st.column_config.NumberColumn(format="%.1f")})
+    sc1,sc2=st.columns(2)
+    for col,(title,key,color) in zip([sc1,sc2],[("Peak gate queue P50 (trucks)","Peak gate queue P50","#4f8cff"),("Peak marshalling-area queue P50 (trucks)","Peak marshalling queue P50","#f0a23a")]):
+        f=go.Figure(go.Bar(x=sweep["ELM cap"],y=sweep[key],marker_color=color,
+                           hovertemplate="%{x}: %{y:,.0f} trucks<extra></extra>",text=[f"{v:,.0f}" for v in sweep[key]],textposition="outside"))
+        f.update_layout(height=300,margin=dict(l=20,r=20,t=40,b=20),title=dict(text=title,font=dict(size=14)),
+                        paper_bgcolor="#12161c",plot_bgcolor="#12161c",font=dict(color="#f2f4f7"),
+                        xaxis=dict(type="category"),yaxis=dict(gridcolor="#2a3038",rangemode="tozero"))
+        col.plotly_chart(f,width="stretch",config={"displaylogo":False})
+    st.caption("Values are Monte Carlo percentiles across scenarios. 'Last entry' after 24 h means the cap cannot release the daily demand within the day.")
 
 st.subheader("Main junction bottlenecks")
 st.caption("Node congestion is assessed from peak hourly movements through each junction relative to its configured effective capacity. Delay is shown separately because downstream spillback can create waiting even when node V/C remains below 1.0.")
@@ -855,7 +1109,7 @@ if not junction_summary.empty:
         "avg_wait_min":"Avg wait (min)", "peak_wait_min":"Peak wait (min)",
         "peak_spillback_wait_min":"Peak spillback wait (min)", "congestion":"Congestion"
     })
-    st.dataframe(js,use_container_width=True,hide_index=True,
+    st.dataframe(js,width="stretch",hide_index=True,
                  column_config={
                      "Peak V/C":st.column_config.NumberColumn(format="%.2f"),
                      "Peak utilisation (%)":st.column_config.NumberColumn(format="%.0f%%"),
@@ -869,16 +1123,16 @@ else:
 st.subheader("Junction movement detail")
 if not junction_results.empty:
     js_detail=junction_results.groupby("junction").agg(movements=("truck_id","count"),peak_wait_min=("wait_min","max"),avg_wait_min=("wait_min","mean"),capacity_vph=("capacity_vph","first"),maneuver_delay_sec=("maneuver_delay_sec","first")).reset_index().sort_values("peak_wait_min",ascending=False)
-    st.dataframe(js_detail,use_container_width=True,hide_index=True)
+    st.dataframe(js_detail,width="stretch",hide_index=True)
 else: st.info("No junction movements were recorded in this scenario.")
 
 st.subheader("Physical road network")
 if not roads.empty:
     cols=[c for c in ["road_id","from_node","to_node","distance_km","peak_hourly_flow","capacity_vph","peak_vc","los","avg_wait_min"] if c in roads.columns]
-    st.dataframe(roads[cols].sort_values("peak_vc",ascending=False),use_container_width=True)
+    st.dataframe(roads[cols].sort_values("peak_vc",ascending=False),width="stretch")
 
 st.subheader("Gate flows")
-gate_summary=gates.groupby(["gate","operation"]).size().unstack(fill_value=0).reindex(GATES); st.dataframe(gate_summary,use_container_width=True)
+gate_summary=gates.groupby(["gate","operation"]).size().unstack(fill_value=0).reindex(GATES); st.dataframe(gate_summary,width="stretch")
 
 st.subheader("Export results")
 ec1,ec2,ec3=st.columns(3)
@@ -891,4 +1145,4 @@ trucks["arrival_hour"]=(trucks.arrival_min//60).astype(int); hourly=trucks.group
 
 with st.expander("Truck-level results"):
     display_cols=[c for c in ["truck_id","terminal","cargo","entry_gate","exit_gate","arrival_min","entry_path","exit_path","total_time_min","entry_gate_wait_min","exit_gate_wait_min"] if c in trucks.columns]
-    st.dataframe(trucks[display_cols],use_container_width=True)
+    st.dataframe(trucks[display_cols],width="stretch")
