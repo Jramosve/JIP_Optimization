@@ -683,169 +683,136 @@ st.dataframe(wait_df,use_container_width=True,hide_index=True)
 st.caption("Gate queue stock includes trucks waiting at the gate and trucks delayed on the upstream road while serving that gate; the same truck is counted only once. Queue time is the simulated waiting time before gate processing and is separate from gate processing time and terminal turnaround.")
 
 
-st.subheader("Monte Carlo uncertainty")
-mc_sims=st.number_input("Number of Monte Carlo scenarios",100,20000,10000,100)
-if st.button("Run Monte Carlo"):
-    with st.spinner(f"Running {int(mc_sims):,} fast uncertainty scenarios..."):
+st.subheader("Monte Carlo — Gate congestion")
+mc_sims=st.number_input("Number of Monte Carlo scenarios",100,20000,1000,100)
+if st.button("Run Gate Monte Carlo"):
+    with st.spinner(f"Running {int(mc_sims):,} gate-congestion scenarios..."):
         st.session_state.mc_result=monte_carlo.run_monte_carlo(
-            model, int(mc_sims), int(trucks_per_day), arrival_time_randomization_pct/100, 0.03,
-            management_enabled, int(max_entries), int(seed),
-            entry_gate_rules=entry_rules, exit_gate_rules=exit_rules, entry_access_rules=entry_rules, gate_lanes=gate_lanes,
-            gate_times_sec=gate_times, n2_n1_corridor_lanes=n2_n1_lanes,
-            route_overrides=route_overrides, route_randomization=route_randomization_pct/100,
-            logistics_destination_daily=None,
-            lanes_per_direction=lanes_per_direction, capacity_per_lane_vph=capacity_per_lane,
-            terminal_shares=terminal_shares, cargo_shares=cargo_shares
+            model,
+            int(mc_sims),
+            int(trucks_per_day),
+            arrival_time_randomization_pct/100,
+            0.03,
+            management_enabled,
+            int(max_entries),
+            int(seed),
+            entry_gate_rules=entry_rules,
+            exit_gate_rules=exit_rules,
+            entry_access_rules=entry_rules,
+            gate_lanes=gate_lanes,
+            gate_times_sec=gate_times,
+            terminal_shares=terminal_shares,
+            cargo_shares=cargo_shares,
         )
+
 mc=st.session_state.mc_result
 if mc:
-    m=mc["metrics"]; rep=mc["representative"]
-    st.caption("Fast network-screening Monte Carlo: honours the current gate allocations, editable internal paths, lane/capacity assumptions and demand uncertainty; it does not run 10,000 full SimPy replications.")
-    st.subheader("Peak network V/C")
-    cols=st.columns(5)
-    for i,label in enumerate(["P10","P50","P90","P95","P99"]):
-        cols[i].metric(label, f'{m["peak_network_vc"][label]:.2f}')
+    m=mc.get("metrics", {})
+    results=mc.get("results", pd.DataFrame()).copy()
+    st.caption("Fast gate-congestion Monte Carlo: simulates the current truck demand, hourly arrival profile, appointment cap, cargo mix and gate allocations. Road links, junctions and network V/C are intentionally excluded.")
+
+    # ------------------------------------------------------------
+    # Peak gate queue — main Monte Carlo output
+    # ------------------------------------------------------------
     st.subheader("Peak gate queue")
+    percentile_labels=["P10","P50","P90","P95","P99"]
+    peak_all=m.get("peak_queue_all", {})
     cols=st.columns(5)
-    for i,label in enumerate(["P10","P50","P90","P95","P99"]):
-        cols[i].metric(label, f'{m["peak_queue_all"][label]:.0f}')
-    st.subheader("Peak exit-gate spillback")
-    cols=st.columns(5)
-    for i,label in enumerate(["P10","P50","P90","P95","P99"]):
-        cols[i].metric(label, f'{m["peak_spillback_trucks"][label]:.0f}')
-    st.write("**Representative scenario** — the simulation closest to the joint median of peak queue, network V/C and turn-time proxy.")
-    st.dataframe(pd.DataFrame([rep]),use_container_width=True)
+    for i,label in enumerate(percentile_labels):
+        value=float(peak_all.get(label, 0.0))
+        cols[i].metric(label, f"{value:.0f} trucks")
+
+    # Peak queue by gate
+    st.subheader("Peak queue by gate")
     summary_rows=[]
     for g in GATES:
-        vals=m[f"peak_queue_{g}"]; summary_rows.append({"Gate":g,**vals})
+        vals=m.get(f"peak_queue_{g}", {})
+        summary_rows.append({"Gate":g, **{p:float(vals.get(p,0.0)) for p in percentile_labels}})
     st.dataframe(pd.DataFrame(summary_rows).set_index("Gate"),use_container_width=True)
-    chart_df=mc["results"][["peak_network_vc","peak_queue_all"]].copy().sort_values("peak_network_vc").reset_index(drop=True)
-    st.line_chart(chart_df)
 
+    # ------------------------------------------------------------
+    # Distribution selector — gate queues only
+    # ------------------------------------------------------------
     st.subheader("Monte Carlo output distribution")
-    st.caption("Select the output point you want to inspect. The histogram shows the distribution across all Monte Carlo realisations, with P10, P50, P90, P95 and P99 marked explicitly.")
+    st.caption("Select a gate to inspect the distribution of its peak queue across all Monte Carlo scenarios. P10, P50, P90, P95 and P99 are shown explicitly.")
 
-    metric_options = {
-        "Peak gate queue": "peak_queue",
-        "Peak network V/C": "peak_network_vc",
-        "Peak exit-gate spillback": "peak_spillback_trucks",
-        "Average turnaround proxy": "avg_turn_proxy_min",
-    }
-    selected_metric_label = st.selectbox(
-        "Output metric",
-        list(metric_options.keys()),
-        key="mc_distribution_metric",
-    )
-    selected_metric = metric_options[selected_metric_label]
+    selected_gate=st.selectbox("Gate", GATES, index=1, key="mc_distribution_gate")
+    value_col=f"peak_queue_{selected_gate}"
 
-    if selected_metric == "peak_queue":
-        selected_gate = st.selectbox("Gate", GATES, index=1, key="mc_distribution_gate")
-        value_col = f"peak_queue_{selected_gate}"
-        x_label = f"Peak queue at {selected_gate} (trucks)"
-        value_format = ".0f"
-        suffix = " trucks"
-    elif selected_metric == "peak_network_vc":
-        selected_gate = None
-        value_col = "peak_network_vc"
-        x_label = "Peak network V/C"
-        value_format = ".2f"
-        suffix = ""
-    elif selected_metric == "peak_spillback_trucks":
-        selected_gate = None
-        value_col = "peak_spillback_trucks"
-        x_label = "Peak exit-gate spillback (trucks)"
-        value_format = ".0f"
-        suffix = " trucks"
+    if value_col in results.columns:
+        values=pd.to_numeric(results[value_col],errors="coerce").dropna()
     else:
-        selected_gate = None
-        value_col = "avg_turn_proxy_min"
-        x_label = "Average turnaround proxy (min)"
-        value_format = ".1f"
-        suffix = " min"
+        values=pd.Series(dtype=float)
 
-    values = pd.to_numeric(mc["results"][value_col], errors="coerce").dropna()
     if not values.empty:
-        percentiles = {p: float(values.quantile(q)) for p, q in {"P10":0.10,"P50":0.50,"P90":0.90,"P95":0.95,"P99":0.99}.items()}
+        percentiles={p:float(values.quantile(q)) for p,q in {"P10":0.10,"P50":0.50,"P90":0.90,"P95":0.95,"P99":0.99}.items()}
 
-        # Use a fixed number of bins so the shape remains comparable across outputs.
-        n_bins = 30
-        vmin, vmax = float(values.min()), float(values.max())
-        if np.isclose(vmin, vmax):
-            edges = np.array([vmin - 0.5, vmax + 0.5])
+        n_bins=30
+        vmin,vmax=float(values.min()),float(values.max())
+        if np.isclose(vmin,vmax):
+            edges=np.array([vmin-0.5,vmax+0.5])
         else:
-            edges = np.linspace(vmin, vmax, n_bins + 1)
-        counts, edges = np.histogram(values.to_numpy(), bins=edges)
-        centers = (edges[:-1] + edges[1:]) / 2.0
-        widths = np.diff(edges)
+            edges=np.linspace(vmin,vmax,n_bins+1)
+        counts,edges=np.histogram(values.to_numpy(),bins=edges)
+        centers=(edges[:-1]+edges[1:])/2.0
+        widths=np.diff(edges)
 
-        fig = go.Figure()
+        fig=go.Figure()
         fig.add_trace(go.Bar(
             x=centers,
             y=counts,
-            width=widths * 0.92,
+            width=widths*0.92,
             marker_color="#4f8cff",
             marker_line_width=0,
-            hovertemplate=f"{x_label}: %{{x:{value_format}}}<br>Frequency: %{{y}}<extra></extra>",
+            hovertemplate=f"Peak queue at {selected_gate}: %{{x:.0f}} trucks<br>Frequency: %{{y}}<extra></extra>",
             name="Frequency",
         ))
 
-        percentile_colors = {"P10":"#f59e0b","P50":"#7c8ea3","P90":"#94a3b8","P95":"#6ee7b7","P99":"#67e8f9"}
-        for p, value in percentiles.items():
+        percentile_colors={"P10":"#f59e0b","P50":"#7c8ea3","P90":"#94a3b8","P95":"#6ee7b7","P99":"#67e8f9"}
+        for p,value in percentiles.items():
             fig.add_vline(
                 x=value,
                 line_width=2,
                 line_dash="dash",
                 line_color=percentile_colors[p],
-                annotation_text=f"{p}: {value:{value_format}}",
+                annotation_text=f"{p}: {value:.0f}",
                 annotation_position="top",
                 annotation_font_color=percentile_colors[p],
             )
 
         fig.update_layout(
             height=430,
-            margin=dict(l=20, r=20, t=25, b=20),
+            margin=dict(l=20,r=20,t=25,b=20),
             paper_bgcolor="#12161c",
             plot_bgcolor="#12161c",
             font=dict(color="#f2f4f7"),
-            xaxis=dict(title=x_label, gridcolor="#2a3038", zeroline=False),
-            yaxis=dict(title="Frequency", gridcolor="#2a3038", zeroline=False),
+            xaxis=dict(title=f"Peak queue at {selected_gate} (trucks)",gridcolor="#2a3038",zeroline=False),
+            yaxis=dict(title="Frequency",gridcolor="#2a3038",zeroline=False),
             bargap=0.05,
             showlegend=False,
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+        st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False})
 
-        pct_df = pd.DataFrame({"Percentile": list(percentiles.keys()), "Value": list(percentiles.values())})
-        c1, c2, c3, c4, c5 = st.columns(5)
-        for col, p in zip([c1,c2,c3,c4,c5], percentiles):
-            col.metric(p, f"{percentiles[p]:{value_format}}{suffix}")
+        c1,c2,c3,c4,c5=st.columns(5)
+        for col,p in zip([c1,c2,c3,c4,c5],percentiles):
+            col.metric(p,f"{percentiles[p]:.0f} trucks")
 
-        selected_export = mc["results"][["simulation", "daily_demand", value_col]].copy()
-        selected_export.columns = ["simulation", "daily_demand", selected_metric_label + (f" — {selected_gate}" if selected_gate else "")]
-        csv_selected = selected_export.to_csv(index=False).encode("utf-8")
-        csv_all = mc["results"].to_csv(index=False).encode("utf-8")
-        csv_percentiles = pct_df.to_csv(index=False).encode("utf-8")
-        d1, d2, d3 = st.columns(3)
-        d1.download_button(
-            "Download selected distribution",
-            csv_selected,
-            "jeddah_monte_carlo_selected_output.csv",
-            "text/csv",
-            key="download_mc_selected",
-        )
-        d2.download_button(
-            "Download all Monte Carlo results",
-            csv_all,
-            "jeddah_monte_carlo_all_results.csv",
-            "text/csv",
-            key="download_mc_all",
-        )
-        d3.download_button(
-            "Download percentile summary",
-            csv_percentiles,
-            "jeddah_monte_carlo_percentiles.csv",
-            "text/csv",
-            key="download_mc_percentiles",
-        )
+        pct_df=pd.DataFrame({"Percentile":list(percentiles.keys()),"Value":list(percentiles.values())})
+
+        # Downloads — keep only gate Monte Carlo outputs
+        export_cols=[c for c in ["simulation","daily_demand",value_col] if c in results.columns]
+        selected_export=results[export_cols].copy()
+        selected_export.columns=["simulation","daily_demand",f"Peak queue — {selected_gate}"][:len(selected_export.columns)]
+        csv_selected=selected_export.to_csv(index=False).encode("utf-8")
+        csv_all=results.to_csv(index=False).encode("utf-8")
+        csv_percentiles=pct_df.to_csv(index=False).encode("utf-8")
+
+        d1,d2,d3=st.columns(3)
+        d1.download_button("Download selected gate distribution",csv_selected,"jeddah_monte_carlo_selected_gate.csv","text/csv",key="download_mc_selected")
+        d2.download_button("Download all gate Monte Carlo results",csv_all,"jeddah_monte_carlo_all_gate_results.csv","text/csv",key="download_mc_all")
+        d3.download_button("Download percentile summary",csv_percentiles,"jeddah_monte_carlo_gate_percentiles.csv","text/csv",key="download_mc_percentiles")
+    else:
+        st.info(f"No Monte Carlo results are available for {selected_gate}.")
 
 st.subheader("Main junction bottlenecks")
 st.caption("Node congestion is assessed from peak hourly movements through each junction relative to its configured effective capacity. Delay is shown separately because downstream spillback can create waiting even when node V/C remains below 1.0.")
