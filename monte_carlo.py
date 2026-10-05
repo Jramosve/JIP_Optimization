@@ -24,9 +24,8 @@ import multiprocessing as mp
 import os
 import traceback
 
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    BrokenProcessPool,
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 )
 
 from copy import deepcopy
