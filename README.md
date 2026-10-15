@@ -27,6 +27,11 @@ The fast gate Monte Carlo (`monte_carlo.py`) reproduces the main.py demand gener
 
 It reports P10/P50/P90/P95/P99 of peak gate queue (trucks waiting + in service, sampled every 5 min as in main.py), peak and average gate queue time per gate and operation, and the external marshalling-area backlog, next to the value from the current simulation run. Road-link and junction queueing are not simulated, so results only diverge from main.py when the internal network itself is saturated. Road lanes, capacity per lane and the N4–N2 corridor lanes only affect the full simulation.
 
+## Al-Khumra logistics corridor
+Trucks travelling directly between the Al-Khumra logistics corridor and the port are modelled as a **subset of the daily demand**, never as additional trucks. For each terminal (RSGT, DPW, MPT, Logistics) the user defines the Al-Khumra volume either as a share of that terminal's daily trucks or as trucks/day (truck visits: one entry + one exit), plus the entry and exit gate used by those trucks (`AL_KHUMRA_FLOWS` in `main.py`, editable in the dashboard). Example: with 20,000 trucks/day and 4,000 from Al-Khumra, 4,000 trucks use the corridor gates and the remaining 16,000 follow the general gate allocation.
+
+Tagged trucks keep their terminal, cargo, destination and arrival time; only their gates change. They share gate lanes and queues with other traffic and remain subject to the ELM appointment cap. The selection uses a separate random stream, so with all values at 0 the model is identical to the run without Al-Khumra tagging, and the non-Al-Khumra trucks are identical across Al-Khumra scenarios with the same seed. Truck outputs include an `origin` column (`AL_KHUMRA` / `GENERAL`); the Monte Carlo applies the same rule and reports `al_khumra_trucks` per scenario.
+
 ## Appointment management and marshalling area
 With the ELM cap enabled, trucks that cannot enter in their scheduled hour wait in the external marshalling area and are released FIFO in later hours. The dashboard shows hourly demand vs releases, the marshalling-area queue over the day, per-truck waiting time (`scheduled_arrival_min`, `marshalling_wait_min`) and when the backlog clears. The **ELM cap comparison** runs the Monte Carlo for several caps to show the trade-off between gate queues and marshalling-area waiting.
 

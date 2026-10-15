@@ -437,6 +437,36 @@ def _simulate_batch(cfg, rng, batch):
     # Map the per-terminal destination choice onto global node codes.
     dest_node = cfg["dest_node"][terminal, destination]
 
+    # ---- Al-Khumra corridor (subset of demand) ------------------
+    al_khumra_trucks = np.zeros(batch)
+    ak = cfg.get("al_khumra")
+    if ak is not None:
+        keys = ak["rng"].random((batch, trucks))
+        for t, flow_cfg in enumerate(ak["per_terminal"]):
+            if flow_cfg is None:
+                continue
+            mode, value, ak_entry, ak_exit = flow_cfg
+            mask = terminal == t
+            n_terminal = mask.sum(axis=1)
+            n = (
+                np.floor(value * n_terminal + 0.5).astype(np.int64)
+                if mode == "share" else np.full(batch, int(round(value)))
+            )
+            if (n > n_terminal).any():
+                raise ValueError(
+                    f"Al-Khumra flow for {cfg['terminals'][t]} ({int(n.max()):,} trucks/day) "
+                    f"exceeds the terminal's daily trucks ({int(n_terminal.min()):,})."
+                )
+            k = np.where(mask, keys, np.inf)
+            sorted_k = np.sort(k, axis=1)
+            threshold = np.where(
+                n > 0, sorted_k[np.arange(batch), np.maximum(n - 1, 0)], -np.inf
+            )
+            selected = mask & (k <= threshold[:, None])
+            entry_gate[selected] = ak_entry
+            exit_gate[selected] = ak_exit
+            al_khumra_trucks += selected.sum(axis=1)
+
     # ---- Entry gates -----------------------------------------
     entry_service = cfg["service_min"][0][cargo]
     entry_finish, entry_kpis = _gate_stage(
@@ -488,6 +518,7 @@ def _simulate_batch(cfg, rng, batch):
         "peak_marshalling_wait": marshalling_wait.max(axis=1),
         "marshalling_truck_hours": marshalling_wait.sum(axis=1) / 60.0,
         "last_entry_hour": arrival[:, -1] / 60.0,
+        "al_khumra_trucks": al_khumra_trucks,
     }
 
     return entry_kpis, exit_kpis, marshalling
@@ -606,6 +637,7 @@ def run_monte_carlo(
     graph=None,
     batch_size=None,
     progress_callback=None,
+    al_khumra_flows=None,
     **kwargs,
 ):
     """
@@ -659,6 +691,13 @@ def run_monte_carlo(
         raise ValueError("route_randomization must be between 0 and 1.")
     if graph is None:
         graph = _load_graph(model)
+    if al_khumra_flows is None:
+        al_khumra_flows = getattr(model, "AL_KHUMRA_FLOWS", {})
+    # Same rules and validation as main.py (subset of demand, per terminal).
+    al_khumra_active = {
+        t: dict(cfg) for t, cfg in al_khumra_flows.items()
+        if float(cfg.get("value", 0.0)) > 0
+    }
 
     trucks_per_day = int(trucks_per_day)
     arrival_variability = float(arrival_variability)
@@ -681,6 +720,25 @@ def run_monte_carlo(
             for gate, _ in options:
                 if gate not in gates:
                     gates.append(gate)
+    for terminal, cfg in al_khumra_flows.items():
+        if terminal not in terminal_shares:
+            raise ValueError(f"Unknown terminal in Al-Khumra flows: {terminal}")
+        mode, value = str(cfg.get("mode", "share")), float(cfg.get("value", 0.0))
+        if mode not in ("share", "absolute"):
+            raise ValueError(f"Al-Khumra {terminal}: mode must be 'share' or 'absolute'.")
+        if value < 0 or (mode == "share" and value > 1):
+            raise ValueError(f"Al-Khumra {terminal}: invalid value {value}.")
+        if mode == "absolute" and not value.is_integer():
+            raise ValueError(f"Al-Khumra {terminal}: absolute value must be a whole number.")
+    for terminal, cfg in al_khumra_active.items():
+        for key, lane_key in (("entry_gate", "entry"), ("exit_gate", "exit")):
+            gate = cfg.get(key)
+            if int(gate_lanes.get(gate, {}).get(lane_key, 0)) <= 0:
+                raise ValueError(
+                    f"Al-Khumra {terminal}: {key} {gate} has 0 {lane_key} lanes configured."
+                )
+            if gate not in gates:
+                gates.append(gate)
     gate_index = {g: i for i, g in enumerate(gates)}
 
     for gate, lanes_cfg in gate_lanes.items():
@@ -731,11 +789,15 @@ def run_monte_carlo(
     for t, terminal in enumerate(terminals):
         names = per_terminal[t][0]
         for c, cargo in enumerate(("FULL", "EMPTY")):
+            ak = al_khumra_active.get(terminal)
             for rules, is_entry in (
                 (entry_access_rules, True),
                 (exit_gate_rules, False),
             ):
-                for gate, share in rules[(terminal, cargo)]:
+                options = list(rules[(terminal, cargo)])
+                if ak is not None:
+                    options.append((ak["entry_gate" if is_entry else "exit_gate"], 1.0))
+                for gate, share in options:
                     if float(share) <= 0:
                         continue
                     for name in names:
@@ -781,6 +843,7 @@ def run_monte_carlo(
         ]) / 60.0,
     )
 
+    gate_index_final = gate_index
     cfg = {
         "trucks_per_day": trucks_per_day,
         "arrival_variability": arrival_variability,
@@ -810,6 +873,20 @@ def run_monte_carlo(
         },
         "exit_lanes": {
             g: int(gate_lanes.get(g, {}).get("exit", 0)) for g in gates
+        },
+        # Al-Khumra corridor: (mode, value, entry gate, exit gate) per terminal,
+        # with its own random stream so the main stream is not altered.
+        "al_khumra": None if not al_khumra_active else {
+            "per_terminal": [
+                (
+                    str(al_khumra_active[t].get("mode", "share")),
+                    float(al_khumra_active[t]["value"]),
+                    gate_index_final[al_khumra_active[t]["entry_gate"]],
+                    gate_index_final[al_khumra_active[t]["exit_gate"]],
+                ) if t in al_khumra_active else None
+                for t in terminals
+            ],
+            "rng": np.random.default_rng([int(seed), 0xA1C]),
         },
         # main.py snapshots queues every 5 minutes until 24:00.
         "snapshot_times": np.arange(
@@ -889,6 +966,7 @@ def run_monte_carlo(
             "max_entries_per_hour": max_entries_per_hour,
             "route_randomization": route_randomization,
             "seed": int(seed),
+            "al_khumra_flows": {k: dict(v) for k, v in al_khumra_flows.items()},
             "roads_simulated": False,
             "junctions_simulated": False,
         },

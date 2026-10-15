@@ -173,6 +173,9 @@ SENSITIVITY_CASES = {
         model.EXIT_GATE_RULES, ("DPW", "FULL"), [("G8", 0.5), ("G1", 0.5)])),
     "terminal_process_min": dict(terminal_process_min={
         t: {"FULL": 30.0, "EMPTY": 30.0} for t in model.TERMINAL_PROCESS_MIN}),
+    "al_khumra_flows": dict(al_khumra_flows={
+        **model.AL_KHUMRA_FLOWS,
+        "RSGT": {"mode": "share", "value": 0.30, "entry_gate": "G9", "exit_gate": "G8"}}),
     # A detour G4 > N04 > N05 > N04 > MPT2 instead of the direct G4 > N04 > MPT2.
     "route_overrides": dict(route_overrides={
         ("G4", "MPT2"): ["G4", "N04", "N05", "N04", "MPT2"]}),
