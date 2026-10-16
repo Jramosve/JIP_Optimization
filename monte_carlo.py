@@ -112,6 +112,13 @@ def _categorical(u, cumulative, group):
     return idx
 
 
+def _ak_value(cfg, direction):
+    """Al-Khumra entry or exit value (same rule as main.al_khumra_value):
+    a single "value" key from older configurations applies to both."""
+    key = f"{direction}_value"
+    return float(cfg[key]) if key in cfg else float(cfg.get("value", 0.0))
+
+
 def _load_graph(model):
     key = id(model)
     if key not in _GRAPH_CACHE:
@@ -438,34 +445,42 @@ def _simulate_batch(cfg, rng, batch):
     dest_node = cfg["dest_node"][terminal, destination]
 
     # ---- Al-Khumra corridor (subset of demand) ------------------
+    # One random ranking per terminal for both directions, so entry and
+    # exit selections are nested (as in main.apply_al_khumra_flows).
     al_khumra_trucks = np.zeros(batch)
+    al_khumra_entry_trucks = np.zeros(batch)
+    al_khumra_exit_trucks = np.zeros(batch)
     ak = cfg.get("al_khumra")
     if ak is not None:
         keys = ak["rng"].random((batch, trucks))
         for t, flow_cfg in enumerate(ak["per_terminal"]):
             if flow_cfg is None:
                 continue
-            mode, value, ak_entry, ak_exit = flow_cfg
+            mode, entry_value, exit_value, ak_entry, ak_exit = flow_cfg
             mask = terminal == t
             n_terminal = mask.sum(axis=1)
-            n = (
-                np.floor(value * n_terminal + 0.5).astype(np.int64)
-                if mode == "share" else np.full(batch, int(round(value)))
-            )
-            if (n > n_terminal).any():
-                raise ValueError(
-                    f"Al-Khumra flow for {cfg['terminals'][t]} ({int(n.max()):,} trucks/day) "
-                    f"exceeds the terminal's daily trucks ({int(n_terminal.min()):,})."
-                )
             k = np.where(mask, keys, np.inf)
             sorted_k = np.sort(k, axis=1)
-            threshold = np.where(
-                n > 0, sorted_k[np.arange(batch), np.maximum(n - 1, 0)], -np.inf
-            )
-            selected = mask & (k <= threshold[:, None])
-            entry_gate[selected] = ak_entry
-            exit_gate[selected] = ak_exit
-            al_khumra_trucks += selected.sum(axis=1)
+            selected = {}
+            for direction, value in (("entry", entry_value), ("exit", exit_value)):
+                n = (
+                    np.floor(value * n_terminal + 0.5).astype(np.int64)
+                    if mode == "share" else np.full(batch, int(round(value)))
+                )
+                if (n > n_terminal).any():
+                    raise ValueError(
+                        f"Al-Khumra {direction} flow for {cfg['terminals'][t]} ({int(n.max()):,} trucks/day) "
+                        f"exceeds the terminal's daily trucks ({int(n_terminal.min()):,})."
+                    )
+                threshold = np.where(
+                    n > 0, sorted_k[np.arange(batch), np.maximum(n - 1, 0)], -np.inf
+                )
+                selected[direction] = mask & (k <= threshold[:, None])
+            entry_gate[selected["entry"]] = ak_entry
+            exit_gate[selected["exit"]] = ak_exit
+            al_khumra_trucks += (selected["entry"] | selected["exit"]).sum(axis=1)
+            al_khumra_entry_trucks += selected["entry"].sum(axis=1)
+            al_khumra_exit_trucks += selected["exit"].sum(axis=1)
 
     # ---- Entry gates -----------------------------------------
     entry_service = cfg["service_min"][0][cargo]
@@ -519,6 +534,8 @@ def _simulate_batch(cfg, rng, batch):
         "marshalling_truck_hours": marshalling_wait.sum(axis=1) / 60.0,
         "last_entry_hour": arrival[:, -1] / 60.0,
         "al_khumra_trucks": al_khumra_trucks,
+        "al_khumra_entry_trucks": al_khumra_entry_trucks,
+        "al_khumra_exit_trucks": al_khumra_exit_trucks,
     }
 
     return entry_kpis, exit_kpis, marshalling
@@ -696,7 +713,7 @@ def run_monte_carlo(
     # Same rules and validation as main.py (subset of demand, per terminal).
     al_khumra_active = {
         t: dict(cfg) for t, cfg in al_khumra_flows.items()
-        if float(cfg.get("value", 0.0)) > 0
+        if _ak_value(cfg, "entry") > 0 or _ak_value(cfg, "exit") > 0
     }
 
     trucks_per_day = int(trucks_per_day)
@@ -723,15 +740,19 @@ def run_monte_carlo(
     for terminal, cfg in al_khumra_flows.items():
         if terminal not in terminal_shares:
             raise ValueError(f"Unknown terminal in Al-Khumra flows: {terminal}")
-        mode, value = str(cfg.get("mode", "share")), float(cfg.get("value", 0.0))
+        mode = str(cfg.get("mode", "share"))
         if mode not in ("share", "absolute"):
             raise ValueError(f"Al-Khumra {terminal}: mode must be 'share' or 'absolute'.")
-        if value < 0 or (mode == "share" and value > 1):
-            raise ValueError(f"Al-Khumra {terminal}: invalid value {value}.")
-        if mode == "absolute" and not value.is_integer():
-            raise ValueError(f"Al-Khumra {terminal}: absolute value must be a whole number.")
+        for direction in ("entry", "exit"):
+            value = _ak_value(cfg, direction)
+            if value < 0 or (mode == "share" and value > 1):
+                raise ValueError(f"Al-Khumra {terminal}: invalid {direction} value {value}.")
+            if mode == "absolute" and not value.is_integer():
+                raise ValueError(f"Al-Khumra {terminal}: {direction} absolute value must be a whole number.")
     for terminal, cfg in al_khumra_active.items():
         for key, lane_key in (("entry_gate", "entry"), ("exit_gate", "exit")):
+            if _ak_value(cfg, lane_key) <= 0:
+                continue
             gate = cfg.get(key)
             if int(gate_lanes.get(gate, {}).get(lane_key, 0)) <= 0:
                 raise ValueError(
@@ -795,8 +816,9 @@ def run_monte_carlo(
                 (exit_gate_rules, False),
             ):
                 options = list(rules[(terminal, cargo)])
-                if ak is not None:
-                    options.append((ak["entry_gate" if is_entry else "exit_gate"], 1.0))
+                direction = "entry" if is_entry else "exit"
+                if ak is not None and _ak_value(ak, direction) > 0:
+                    options.append((ak[f"{direction}_gate"], 1.0))
                 for gate, share in options:
                     if float(share) <= 0:
                         continue
@@ -874,15 +896,18 @@ def run_monte_carlo(
         "exit_lanes": {
             g: int(gate_lanes.get(g, {}).get("exit", 0)) for g in gates
         },
-        # Al-Khumra corridor: (mode, value, entry gate, exit gate) per terminal,
-        # with its own random stream so the main stream is not altered.
+        # Al-Khumra corridor: (mode, entry value, exit value, entry gate,
+        # exit gate) per terminal, with its own random stream so the main
+        # stream is not altered. A gate index of -1 is never used because
+        # its direction has value 0.
         "al_khumra": None if not al_khumra_active else {
             "per_terminal": [
                 (
                     str(al_khumra_active[t].get("mode", "share")),
-                    float(al_khumra_active[t]["value"]),
-                    gate_index_final[al_khumra_active[t]["entry_gate"]],
-                    gate_index_final[al_khumra_active[t]["exit_gate"]],
+                    _ak_value(al_khumra_active[t], "entry"),
+                    _ak_value(al_khumra_active[t], "exit"),
+                    gate_index_final.get(al_khumra_active[t].get("entry_gate"), -1),
+                    gate_index_final.get(al_khumra_active[t].get("exit_gate"), -1),
                 ) if t in al_khumra_active else None
                 for t in terminals
             ],

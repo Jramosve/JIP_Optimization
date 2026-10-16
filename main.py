@@ -378,10 +378,17 @@ EXIT_GATE_RULES = {
 # corridor gates defined here. All other trucks keep the general gate rules.
 #
 # Per terminal:
-#   mode = "share"    -> value = share of that terminal's daily trucks (0-1)
-#   mode = "absolute" -> value = Al-Khumra trucks/day for that terminal
-#                        (truck visits, i.e. one entry + one exit each)
-#   entry_gate / exit_gate = gates used by the Al-Khumra trucks
+#   mode = "share"    -> entry_value / exit_value = share of that terminal's
+#                        daily trucks (0-1)
+#   mode = "absolute" -> entry_value / exit_value = trucks/day
+#   entry_value = trucks that ENTER the port from Al-Khumra (use entry_gate)
+#   exit_value  = trucks that LEAVE the port to Al-Khumra (use exit_gate)
+#   A single "value" (older configurations) sets both entry and exit.
+#
+# Entry and exit selections are nested: trucks are ranked once per terminal
+# and the first entry_value / exit_value of that ranking are tagged, so the
+# trucks entering from Al-Khumra are the first ones to return there. With
+# entry_value == exit_value this is the same as one Al-Khumra subset.
 #
 # With every value = 0 the model is identical to the run without
 # Al-Khumra tagging: the selection uses a separate random stream, so the
@@ -392,10 +399,10 @@ GENERAL_ORIGIN = "GENERAL"
 AL_KHUMRA_MODES = ("share", "absolute")
 
 AL_KHUMRA_FLOWS = {
-    "RSGT": {"mode": "share", "value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "DPW": {"mode": "share", "value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "MPT": {"mode": "share", "value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "LOGISTICS": {"mode": "share", "value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "RSGT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "DPW": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "LOGISTICS": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
 }
 
 
@@ -1390,16 +1397,27 @@ def build_daily_terminal_destinations(total_trucks, logistics_destination_daily=
     return assignments
 
 
+def al_khumra_value(cfg, direction):
+    """Entry or exit value of one terminal's flow; a single "value" key
+    (older configurations) applies to both directions."""
+    key = f"{direction}_value"
+    return float(cfg[key]) if key in cfg else float(cfg.get("value", 0.0))
+
+
 def al_khumra_active_flows(flows=None):
-    """Terminals with a non-zero Al-Khumra flow."""
+    """Terminals with a non-zero Al-Khumra entry or exit flow."""
     flows = AL_KHUMRA_FLOWS if flows is None else flows
-    return {t: cfg for t, cfg in flows.items() if float(cfg.get("value", 0.0)) > 0}
+    return {
+        t: cfg for t, cfg in flows.items()
+        if al_khumra_value(cfg, "entry") > 0 or al_khumra_value(cfg, "exit") > 0
+    }
 
 
-def al_khumra_count(cfg, terminal_trucks):
-    """Al-Khumra trucks/day for one terminal (share rounded half-up)."""
+def al_khumra_count(cfg, terminal_trucks, direction="entry"):
+    """Al-Khumra trucks/day entering or leaving for one terminal
+    (share rounded half-up)."""
     mode = str(cfg.get("mode", "share"))
-    value = float(cfg.get("value", 0.0))
+    value = al_khumra_value(cfg, direction)
     if mode == "share":
         return int(math.floor(value * int(terminal_trucks) + 0.5))
     return int(round(value))
@@ -1420,20 +1438,30 @@ def apply_al_khumra_flows(trucks, flows=None, seed=None):
     by_terminal = {}
     for i, truck in enumerate(trucks):
         truck["origin"] = GENERAL_ORIGIN
+        truck["al_khumra_entry"] = False
+        truck["al_khumra_exit"] = False
         by_terminal.setdefault(truck["terminal"], []).append(i)
     for terminal, cfg in al_khumra_active_flows(flows).items():
         indices = by_terminal.get(terminal, [])
-        n = al_khumra_count(cfg, len(indices))
-        if n > len(indices):
-            raise ValueError(
-                f"Al-Khumra flow for {terminal} is {n:,} trucks/day, but {terminal} "
-                f"only has {len(indices):,} trucks/day in this scenario."
-            )
+        counts = {d: al_khumra_count(cfg, len(indices), d) for d in ("entry", "exit")}
+        for direction, n in counts.items():
+            if n > len(indices):
+                raise ValueError(
+                    f"Al-Khumra {direction} flow for {terminal} is {n:,} trucks/day, but {terminal} "
+                    f"only has {len(indices):,} trucks/day in this scenario."
+                )
+        # One ranking per terminal for both directions, so the selections
+        # are nested: the trucks entering from Al-Khumra are the first ones
+        # to leave towards it.
         order = list(indices)
         random.Random(f"al_khumra:{seed}:{terminal}").shuffle(order)
-        for i in order[:n]:
+        for i in order[:counts["entry"]]:
             trucks[i]["origin"] = AL_KHUMRA_ORIGIN
+            trucks[i]["al_khumra_entry"] = True
             trucks[i]["entry_gate"] = cfg["entry_gate"]
+        for i in order[:counts["exit"]]:
+            trucks[i]["origin"] = AL_KHUMRA_ORIGIN
+            trucks[i]["al_khumra_exit"] = True
             trucks[i]["exit_gate"] = cfg["exit_gate"]
     return trucks
 
@@ -2909,17 +2937,18 @@ def validate_configuration():
         if terminal not in TERMINAL_SHARES:
             raise ValueError(f"Unknown terminal in AL_KHUMRA_FLOWS: {terminal}")
         mode = str(cfg.get("mode", "share"))
-        value = float(cfg.get("value", 0.0))
         if mode not in AL_KHUMRA_MODES:
             raise ValueError(f"Al-Khumra {terminal}: mode must be one of {AL_KHUMRA_MODES}; got {mode!r}.")
-        if value < 0:
-            raise ValueError(f"Al-Khumra {terminal}: value must be >= 0.")
-        if mode == "share" and value > 1:
-            raise ValueError(f"Al-Khumra {terminal}: share must be between 0 and 1; got {value}.")
-        if mode == "absolute" and not float(value).is_integer():
-            raise ValueError(f"Al-Khumra {terminal}: absolute value must be a whole number of trucks/day; got {value}.")
-        if value > 0:
-            for key, lane_key in (("entry_gate", "entry"), ("exit_gate", "exit")):
+        for direction in ("entry", "exit"):
+            value = al_khumra_value(cfg, direction)
+            if value < 0:
+                raise ValueError(f"Al-Khumra {terminal}: {direction} value must be >= 0.")
+            if mode == "share" and value > 1:
+                raise ValueError(f"Al-Khumra {terminal}: {direction} share must be between 0 and 1; got {value}.")
+            if mode == "absolute" and not float(value).is_integer():
+                raise ValueError(f"Al-Khumra {terminal}: {direction} absolute value must be a whole number of trucks/day; got {value}.")
+            if value > 0:
+                key, lane_key = f"{direction}_gate", direction
                 gate = cfg.get(key)
                 if gate not in GATE_LANES:
                     raise ValueError(f"Al-Khumra {terminal}: unknown {key} {gate!r}.")
@@ -3569,8 +3598,10 @@ def run_simulation(
                     terminal,
                     destination_raw if terminal == "MPT" else None,
                 )
-                routing_pairs.add((cfg["entry_gate"], destination))
-                routing_pairs.add((destination, cfg["exit_gate"]))
+                if al_khumra_value(cfg, "entry") > 0:
+                    routing_pairs.add((cfg["entry_gate"], destination))
+                if al_khumra_value(cfg, "exit") > 0:
+                    routing_pairs.add((destination, cfg["exit_gate"]))
 
         connectivity_errors = []
         for start, destination in sorted(routing_pairs):
@@ -3602,11 +3633,13 @@ def run_simulation(
         ak_by_terminal = {}
         for t in trucks:
             if t["origin"] == AL_KHUMRA_ORIGIN:
-                ak_by_terminal[t["terminal"]] = ak_by_terminal.get(t["terminal"], 0) + 1
+                counts = ak_by_terminal.setdefault(t["terminal"], [0, 0])
+                counts[0] += t["al_khumra_entry"]
+                counts[1] += t["al_khumra_exit"]
         if ak_by_terminal:
             print("Al-Khumra corridor trucks: " + ", ".join(
-                f"{k} {v:,} ({AL_KHUMRA_FLOWS[k]['entry_gate']} in / {AL_KHUMRA_FLOWS[k]['exit_gate']} out)"
-                for k, v in ak_by_terminal.items()
+                f"{k} {n_in:,} in via {AL_KHUMRA_FLOWS[k]['entry_gate']} / {n_out:,} out via {AL_KHUMRA_FLOWS[k]['exit_gate']}"
+                for k, (n_in, n_out) in ak_by_terminal.items()
             ))
 
         env = simpy.Environment()

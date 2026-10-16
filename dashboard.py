@@ -204,10 +204,11 @@ AK_LABEL_TO_MODE={v:k for k,v in AK_MODE_LABELS.items()}
 def al_khumra_df(flows):
     rows=[]
     for terminal in TERMINALS:
-        cfg=flows.get(terminal,{"mode":"share","value":0.0,"entry_gate":"G9","exit_gate":"G8"})
-        mode=str(cfg.get("mode","share")); value=float(cfg.get("value",0.0))
-        rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],"Value":value*100.0 if mode=="share" else value,
-                     "Entry gate":cfg.get("entry_gate","G9"),"Exit gate":cfg.get("exit_gate","G8")})
+        cfg=flows.get(terminal,{"mode":"share","entry_value":0.0,"exit_value":0.0,"entry_gate":"G9","exit_gate":"G8"})
+        mode=str(cfg.get("mode","share")); scale=100.0 if mode=="share" else 1.0
+        rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],
+                     "Entry value":model.al_khumra_value(cfg,"entry")*scale,"Entry gate":cfg.get("entry_gate","G9"),
+                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8")})
     return pd.DataFrame(rows)
 
 def df_to_al_khumra(df, terminal_trucks, gate_lanes):
@@ -215,24 +216,28 @@ def df_to_al_khumra(df, terminal_trucks, gate_lanes):
     flows={}; errors=[]; summary=[]
     for _,r in df.iterrows():
         terminal=str(r["Terminal"]); mode=AK_LABEL_TO_MODE.get(str(r["Input mode"]),"share")
-        raw=float(r["Value"] or 0.0); entry=str(r["Entry gate"]); exit_=str(r["Exit gate"])
-        if raw<0: errors.append(f"Al-Khumra {terminal}: value cannot be negative."); raw=0.0
-        if mode=="share":
-            if raw>100: errors.append(f"Al-Khumra {terminal}: share cannot exceed 100%.")
-            value=raw/100.0
-        else:
-            if not float(raw).is_integer(): errors.append(f"Al-Khumra {terminal}: trucks/day must be a whole number.")
-            value=raw
-        cfg={"mode":mode,"value":value,"entry_gate":entry,"exit_gate":exit_}
+        cfg={"mode":mode,"entry_gate":str(r["Entry gate"]),"exit_gate":str(r["Exit gate"])}
+        n_terminal=int(terminal_trucks.get(terminal,0)); n={}
+        for direction,label,lanes_label in [("entry","Entry","IN"),("exit","Exit","OUT")]:
+            raw=float(r[f"{label} value"] or 0.0)
+            if raw<0: errors.append(f"Al-Khumra {terminal}: {direction} value cannot be negative."); raw=0.0
+            if mode=="share":
+                if raw>100: errors.append(f"Al-Khumra {terminal}: {direction} share cannot exceed 100%.")
+                value=raw/100.0
+            else:
+                if not float(raw).is_integer(): errors.append(f"Al-Khumra {terminal}: {direction} trucks/day must be a whole number.")
+                value=raw
+            cfg[f"{direction}_value"]=value
+            n[direction]=model.al_khumra_count(cfg,n_terminal,direction) if value>0 else 0
+            if n[direction]>n_terminal: errors.append(f"Al-Khumra {terminal}: {n[direction]:,} {direction} trucks/day exceeds the {n_terminal:,} trucks/day of {terminal} in this scenario.")
+            gate=cfg[f"{direction}_gate"]
+            if value>0 and int(gate_lanes.get(gate,{}).get(direction,0))<=0:
+                errors.append(f"Al-Khumra {terminal}: {gate} has 0 {direction} lanes. Add {gate} {lanes_label} lanes (Advanced mode) or choose another gate.")
         flows[terminal]=cfg
-        n_terminal=int(terminal_trucks.get(terminal,0)); n=model.al_khumra_count(cfg,n_terminal) if value>0 else 0
-        if n>n_terminal: errors.append(f"Al-Khumra {terminal}: {n:,} trucks/day exceeds the {n_terminal:,} trucks/day of {terminal} in this scenario.")
-        if value>0:
-            for gate,lane_key,label in [(entry,"entry","IN"),(exit_,"exit","OUT")]:
-                if int(gate_lanes.get(gate,{}).get(lane_key,0))<=0:
-                    errors.append(f"Al-Khumra {terminal}: {gate} has 0 {lane_key} lanes. Add {gate} {label} lanes (Advanced mode) or choose another gate.")
-        summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,"Al-Khumra trucks/day":n,
-                        "Other trucks/day":n_terminal-n,"Al-Khumra gates":f"{entry} in / {exit_} out" if n>0 else "—"})
+        summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,
+                        "Enter from Al-Khumra":n["entry"],"Leave to Al-Khumra":n["exit"],
+                        "Round trip (both)":min(n["entry"],n["exit"]),
+                        "Al-Khumra gates":(f"{cfg['entry_gate'] if n['entry'] else '—'} in / {cfg['exit_gate'] if n['exit'] else '—'} out") if (n["entry"] or n["exit"]) else "—"})
     return flows, errors, pd.DataFrame(summary)
 
 def terminal_process_df(process):
@@ -803,17 +808,19 @@ with col2:
 st.subheader("Al-Khumra logistics corridor")
 st.caption("Trucks travelling directly between the Al-Khumra corridor and the port. They are part of the daily demand, not additional trucks: "
            "for each terminal, the Al-Khumra trucks use the gates defined here and the remaining trucks follow the general gate allocation above. "
-           "Define each terminal either as a share of its daily trucks or as trucks/day (truck visits: one entry + one exit). Cargo mix and appointment cap apply as for any other truck.")
+           "Define, for each terminal, how many of its daily trucks ENTER the port from Al-Khumra and how many LEAVE towards Al-Khumra, either as a share of the terminal's trucks or as trucks/day. "
+           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). Cargo mix and appointment cap apply as for any other truck.")
 ak_editor=st.data_editor(al_khumra_df(model.AL_KHUMRA_FLOWS),width="stretch",num_rows="fixed",hide_index=True,disabled=["Terminal"],
     column_config={"Input mode":st.column_config.SelectboxColumn("Input mode",options=list(AK_MODE_LABELS.values()),required=True),
-                   "Value":st.column_config.NumberColumn("Value",min_value=0.0,step=1.0,help="% of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Entry value":st.column_config.NumberColumn("Entry value",min_value=0.0,step=1.0,help="Trucks entering the port from Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Exit value":st.column_config.NumberColumn("Exit value",min_value=0.0,step=1.0,help="Trucks leaving the port towards Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
                    "Entry gate":st.column_config.SelectboxColumn("Entry gate",options=GATES,required=True),
                    "Exit gate":st.column_config.SelectboxColumn("Exit gate",options=GATES,required=True)},key="al_khumra_editor")
 terminal_trucks_day=model.allocate_integer_counts(int(trucks_per_day),terminal_shares) if not any("Terminal shares" in e for e in flow_errors) else {}
 al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes); flow_errors+=ak_errors
-ak_total=int(ak_summary["Al-Khumra trucks/day"].sum())
+ak_in=int(ak_summary["Enter from Al-Khumra"].sum()); ak_out=int(ak_summary["Leave to Al-Khumra"].sum())
 st.dataframe(ak_summary,width="stretch",hide_index=True)
-if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_total:,} of {int(trucks_per_day):,} trucks/day; the other {int(trucks_per_day)-ak_total:,} trucks/day follow the general gate allocation.")
+if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_in:,} of {int(trucks_per_day):,} trucks/day enter from Al-Khumra and {ak_out:,} leave towards it; all other entries and exits follow the general gate allocation.")
 
 if mode=="Advanced":
     st.subheader("Processing times")
@@ -1268,12 +1275,24 @@ gate_summary=gates.groupby(["gate","operation"]).size().unstack(fill_value=0).re
 
 if "origin" in trucks.columns and (trucks["origin"]==model.AL_KHUMRA_ORIGIN).any():
     st.subheader("Gate flows by origin — Al-Khumra corridor vs other traffic")
-    by_origin=gates.merge(trucks[["truck_id","origin","terminal"]],on="truck_id",how="left")
-    by_origin["origin"]=by_origin["origin"].map({model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"})
+    ak_cols=[c for c in ["al_khumra_entry","al_khumra_exit"] if c in trucks.columns]
+    by_origin=gates.merge(trucks[["truck_id","origin","terminal",*ak_cols]],on="truck_id",how="left")
+    if len(ak_cols)==2:
+        # Entry activities use the entry tag, exit activities the exit tag.
+        is_ak=np.where(by_origin["operation"]=="ENTRY",by_origin["al_khumra_entry"],by_origin["al_khumra_exit"]).astype(bool)
+    else:
+        is_ak=(by_origin["origin"]==model.AL_KHUMRA_ORIGIN).to_numpy()
+    by_origin["origin"]=np.where(is_ak,"Al-Khumra","Other")
     flow_tbl=by_origin.groupby(["gate","operation","origin"]).size().unstack(fill_value=0)
     wait_tbl=by_origin.groupby(["gate","operation","origin"])["wait_min"].mean().unstack().round(1).add_suffix(" — avg queue time (min)")
     st.dataframe(flow_tbl.join(wait_tbl),width="stretch")
-    st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")
+    if len(ak_cols)==2:
+        per_terminal=trucks.groupby("terminal").agg(**{"Trucks":("truck_id","size"),"Enter from Al-Khumra":("al_khumra_entry","sum"),
+                                                     "Leave to Al-Khumra":("al_khumra_exit","sum")})
+        per_terminal["Round trip (both)"]=trucks[trucks.al_khumra_entry & trucks.al_khumra_exit].groupby("terminal").size().reindex(per_terminal.index,fill_value=0)
+        st.dataframe(per_terminal,width="stretch")
+    else:
+        st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")
     st.caption("Al-Khumra and other trucks share the same gate lanes and FIFO queue; gate queue stock is therefore reported per gate, not split by origin. Queue time by origin is the average wait before gate processing.")
 
 st.subheader("Export results")
@@ -1286,5 +1305,5 @@ st.subheader("Hourly arrivals")
 trucks["arrival_hour"]=(trucks.arrival_min//60).astype(int); hourly=trucks.groupby("arrival_hour").size().reindex(range(24),fill_value=0); st.bar_chart(hourly)
 
 with st.expander("Truck-level results"):
-    display_cols=[c for c in ["truck_id","terminal","cargo","origin","entry_gate","exit_gate","arrival_min","entry_path","exit_path","total_time_min","entry_gate_wait_min","exit_gate_wait_min"] if c in trucks.columns]
+    display_cols=[c for c in ["truck_id","terminal","cargo","origin","al_khumra_entry","al_khumra_exit","entry_gate","exit_gate","arrival_min","entry_path","exit_path","total_time_min","entry_gate_wait_min","exit_gate_wait_min"] if c in trucks.columns]
     st.dataframe(trucks[display_cols],width="stretch")
