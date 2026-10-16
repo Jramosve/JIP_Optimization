@@ -140,3 +140,82 @@ def test_replay_main_al_khumra_trucks_through_gate_engine(runs, monkeypatch):
     qs = main_run["queue_stock"]
     for gate, grp in qs[qs["operation"] == "ENTRY"].groupby("gate"):
         assert row[f"peak_queue_{gate}_ENTRY"] == grp["queue_stock"].max()
+
+
+# ---- Separate entry / exit values ---------------------------------------
+
+SPLIT_FLOWS = {
+    **ZERO_FLOWS,
+    "RSGT": {"mode": "share", "entry_value": 0.20, "exit_value": 0.30, "entry_gate": "G6", "exit_gate": "G8"},
+    "DPW": {"mode": "absolute", "entry_value": 1200, "exit_value": 400, "entry_gate": "G9", "exit_gate": "G1"},
+}
+
+
+@pytest.fixture(scope="module")
+def split_run():
+    return run_main(trucks_per_day=20000, seed=7, arrival_time_variability=0.15,
+                    gate_lanes=LANES_G6, al_khumra_flows=SPLIT_FLOWS)
+
+
+def test_entry_and_exit_volumes_are_separate(split_run):
+    t = split_run["trucks"]
+    rsgt, dpw = t[t.terminal == "RSGT"], t[t.terminal == "DPW"]
+    assert rsgt.al_khumra_entry.sum() == 1600 and rsgt.al_khumra_exit.sum() == 2400  # 20% / 30% of 8,000
+    assert dpw.al_khumra_entry.sum() == 1200 and dpw.al_khumra_exit.sum() == 400
+    assert len(t) == 20000
+
+
+def test_entry_and_exit_selections_are_nested(split_run):
+    t = split_run["trucks"].set_index("truck_id")
+    for terminal in ("RSGT", "DPW"):
+        sub = t[t.terminal == terminal]
+        entering, leaving = set(sub.index[sub.al_khumra_entry]), set(sub.index[sub.al_khumra_exit])
+        small, large = sorted([entering, leaving], key=len)
+        assert small <= large
+
+
+def test_each_direction_uses_its_own_gate(split_run, runs):
+    t = split_run["trucks"].set_index("truck_id")
+    base = runs["none"]["trucks"].set_index("truck_id")
+    for terminal, cfg in (("RSGT", SPLIT_FLOWS["RSGT"]), ("DPW", SPLIT_FLOWS["DPW"])):
+        sub = t[t.terminal == terminal]
+        assert set(sub[sub.al_khumra_entry].entry_gate) == {cfg["entry_gate"]}
+        assert set(sub[sub.al_khumra_exit].exit_gate) == {cfg["exit_gate"]}
+        # The other direction keeps the general gate rules.
+        no_entry = sub.index[~sub.al_khumra_entry]
+        no_exit = sub.index[~sub.al_khumra_exit]
+        assert t.loc[no_entry, "entry_gate"].equals(base.loc[no_entry, "entry_gate"])
+        assert t.loc[no_exit, "exit_gate"].equals(base.loc[no_exit, "exit_gate"])
+    others = t.index[~t.terminal.isin(["RSGT", "DPW"])]
+    assert t.loc[others, ["entry_gate", "exit_gate"]].equals(base.loc[others, ["entry_gate", "exit_gate"]])
+
+
+def test_equal_entry_and_exit_values_match_single_value(runs):
+    same = {t: {k: v for k, v in c.items() if k != "value"} | {"entry_value": c["value"], "exit_value": c["value"]}
+            for t, c in FLOWS.items()}
+    r = run_main(trucks_per_day=20000, seed=7, arrival_time_variability=0.15, gate_lanes=LANES_G6, al_khumra_flows=same)
+    assert r["trucks"].equals(runs["ak"]["trucks"])
+    assert r["queue_stock"].equals(runs["ak"]["queue_stock"])
+
+
+def test_exit_only_flow_does_not_need_entry_lanes():
+    # G6 has 0 entry lanes by default; an exit-only flow must not require them.
+    flows = {**ZERO_FLOWS, "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.5, "entry_gate": "G6", "exit_gate": "G9"}}
+    t = run_main(trucks_per_day=10500, seed=3, al_khumra_flows=flows)["trucks"]
+    assert t[t.terminal == "MPT"].al_khumra_exit.sum() == 1050
+    assert not t.al_khumra_entry.any()
+    with pytest.raises(ValueError, match="0 entry lanes"):
+        run_main(trucks_per_day=10500, seed=3,
+                 al_khumra_flows={**flows, "MPT": {**flows["MPT"], "entry_value": 0.1}})
+
+
+def test_monte_carlo_entry_and_exit_volumes(split_run):
+    res = mcm.run_monte_carlo(
+        model, 40, trucks_per_day=20000, arrival_variability=0.15, seed=7,
+        gate_lanes=LANES_G6, al_khumra_flows=SPLIT_FLOWS,
+    )["results"]
+    t = split_run["trucks"]
+    assert (res["al_khumra_entry_trucks"] == t.al_khumra_entry.sum()).all()
+    assert (res["al_khumra_exit_trucks"] == t.al_khumra_exit.sum()).all()
+    assert (res["al_khumra_trucks"] == (t.al_khumra_entry | t.al_khumra_exit).sum()).all()
+    assert (res["peak_queue_G6_ENTRY"] > 0).all()

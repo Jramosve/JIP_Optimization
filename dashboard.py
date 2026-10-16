@@ -204,10 +204,11 @@ AK_LABEL_TO_MODE={v:k for k,v in AK_MODE_LABELS.items()}
 def al_khumra_df(flows):
     rows=[]
     for terminal in TERMINALS:
-        cfg=flows.get(terminal,{"mode":"share","value":0.0,"entry_gate":"G9","exit_gate":"G8"})
-        mode=str(cfg.get("mode","share")); value=float(cfg.get("value",0.0))
-        rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],"Value":value*100.0 if mode=="share" else value,
-                     "Entry gate":cfg.get("entry_gate","G9"),"Exit gate":cfg.get("exit_gate","G8")})
+        cfg=flows.get(terminal,{"mode":"share","entry_value":0.0,"exit_value":0.0,"entry_gate":"G9","exit_gate":"G8"})
+        mode=str(cfg.get("mode","share")); scale=100.0 if mode=="share" else 1.0
+        rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],
+                     "Entry value":model.al_khumra_value(cfg,"entry")*scale,"Entry gate":cfg.get("entry_gate","G9"),
+                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8")})
     return pd.DataFrame(rows)
 
 def df_to_al_khumra(df, terminal_trucks, gate_lanes):
@@ -215,24 +216,28 @@ def df_to_al_khumra(df, terminal_trucks, gate_lanes):
     flows={}; errors=[]; summary=[]
     for _,r in df.iterrows():
         terminal=str(r["Terminal"]); mode=AK_LABEL_TO_MODE.get(str(r["Input mode"]),"share")
-        raw=float(r["Value"] or 0.0); entry=str(r["Entry gate"]); exit_=str(r["Exit gate"])
-        if raw<0: errors.append(f"Al-Khumra {terminal}: value cannot be negative."); raw=0.0
-        if mode=="share":
-            if raw>100: errors.append(f"Al-Khumra {terminal}: share cannot exceed 100%.")
-            value=raw/100.0
-        else:
-            if not float(raw).is_integer(): errors.append(f"Al-Khumra {terminal}: trucks/day must be a whole number.")
-            value=raw
-        cfg={"mode":mode,"value":value,"entry_gate":entry,"exit_gate":exit_}
+        cfg={"mode":mode,"entry_gate":str(r["Entry gate"]),"exit_gate":str(r["Exit gate"])}
+        n_terminal=int(terminal_trucks.get(terminal,0)); n={}
+        for direction,label,lanes_label in [("entry","Entry","IN"),("exit","Exit","OUT")]:
+            raw=float(r[f"{label} value"] or 0.0)
+            if raw<0: errors.append(f"Al-Khumra {terminal}: {direction} value cannot be negative."); raw=0.0
+            if mode=="share":
+                if raw>100: errors.append(f"Al-Khumra {terminal}: {direction} share cannot exceed 100%.")
+                value=raw/100.0
+            else:
+                if not float(raw).is_integer(): errors.append(f"Al-Khumra {terminal}: {direction} trucks/day must be a whole number.")
+                value=raw
+            cfg[f"{direction}_value"]=value
+            n[direction]=model.al_khumra_count(cfg,n_terminal,direction) if value>0 else 0
+            if n[direction]>n_terminal: errors.append(f"Al-Khumra {terminal}: {n[direction]:,} {direction} trucks/day exceeds the {n_terminal:,} trucks/day of {terminal} in this scenario.")
+            gate=cfg[f"{direction}_gate"]
+            if value>0 and int(gate_lanes.get(gate,{}).get(direction,0))<=0:
+                errors.append(f"Al-Khumra {terminal}: {gate} has 0 {direction} lanes. Add {gate} {lanes_label} lanes (Advanced mode) or choose another gate.")
         flows[terminal]=cfg
-        n_terminal=int(terminal_trucks.get(terminal,0)); n=model.al_khumra_count(cfg,n_terminal) if value>0 else 0
-        if n>n_terminal: errors.append(f"Al-Khumra {terminal}: {n:,} trucks/day exceeds the {n_terminal:,} trucks/day of {terminal} in this scenario.")
-        if value>0:
-            for gate,lane_key,label in [(entry,"entry","IN"),(exit_,"exit","OUT")]:
-                if int(gate_lanes.get(gate,{}).get(lane_key,0))<=0:
-                    errors.append(f"Al-Khumra {terminal}: {gate} has 0 {lane_key} lanes. Add {gate} {label} lanes (Advanced mode) or choose another gate.")
-        summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,"Al-Khumra trucks/day":n,
-                        "Other trucks/day":n_terminal-n,"Al-Khumra gates":f"{entry} in / {exit_} out" if n>0 else "—"})
+        summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,
+                        "Enter from Al-Khumra":n["entry"],"Leave to Al-Khumra":n["exit"],
+                        "Round trip (both)":min(n["entry"],n["exit"]),
+                        "Al-Khumra gates":(f"{cfg['entry_gate'] if n['entry'] else '—'} in / {cfg['exit_gate'] if n['exit'] else '—'} out") if (n["entry"] or n["exit"]) else "—"})
     return flows, errors, pd.DataFrame(summary)
 
 def terminal_process_df(process):
@@ -390,7 +395,47 @@ def result_kpis(result):
     }
 
 
-def network_pressure(graph, road_hourly, queue_stock, hour, gates_df=None):
+JUNCTION_STATUS_COLORS = {"Low": "#22a06b", "Moderate": "#e0b100", "High": "#f28c28", "Congested": "#d64545"}
+
+
+def junction_pressure(junctions_df, hour):
+    """Per-junction state in the selected hour, with the same V/C definition and
+    Low/Moderate/High/Congested bands as main.build_junction_summary."""
+    out = {}
+    for node, cfg in model.JUNCTIONS.items():
+        out[node] = {"flow": 0, "capacity": float(cfg.get("capacity_vph", 0.0)), "vc": 0.0,
+                     "avg_wait": 0.0, "peak_wait": 0.0, "queue": 0}
+    if junctions_df is None or junctions_df.empty:
+        for node in out:
+            out[node]["status"] = model.junction_congestion_status(0.0)
+        return out
+    times = np.arange(hour * 60.0, hour * 60.0 + 60.0, 5.0)
+    for node, nd in junctions_df.groupby("junction"):
+        capacity = float(nd["capacity_vph"].iloc[0]) if "capacity_vph" in nd else out.get(node, {}).get("capacity", 0.0)
+        in_hour = nd[(nd["requested_min"] // 60).astype(int) == int(hour)]
+        flow = int(len(in_hour))
+        vc = flow / capacity if capacity > 0 else 0.0
+        # Trucks waiting to cross the junction (requested but not started).
+        req = np.sort(nd["requested_min"].to_numpy(dtype=float))
+        start = np.sort(nd["start_min"].to_numpy(dtype=float))
+        queue = int((np.searchsorted(req, times, side="right") - np.searchsorted(start, times, side="right")).max())
+        out[node] = {
+            "flow": flow, "capacity": capacity, "vc": vc,
+            "avg_wait": float(in_hour["wait_min"].mean()) if flow else 0.0,
+            "peak_wait": float(in_hour["wait_min"].max()) if flow else 0.0,
+            "queue": max(queue, 0),
+        }
+    for node in out:
+        out[node]["status"] = model.junction_congestion_status(out[node]["vc"])
+    return out
+
+
+def junction_tooltip(node, j, sep):
+    return (f"{node}{sep}junction · {j['status']}{sep}{j['flow']:,} veh/h of {j['capacity']:,.0f} · V/C {j['vc']:.2f}"
+            f"{sep}{j['queue']:,} trucks waiting{sep}avg wait {j['avg_wait']:.1f} min · peak {j['peak_wait']:.1f} min")
+
+
+def network_pressure(graph, road_hourly, queue_stock, hour, gates_df=None, junctions_df=None):
     """Per-hour road V/C, gate queues/waits and exit-gate spillback shared by both maps."""
     selected = {}
     if not road_hourly.empty:
@@ -462,10 +507,11 @@ def network_pressure(graph, road_hourly, queue_stock, hour, gates_df=None):
         "spillback_links": spillback_links,
         "physical_to_visual_group": physical_to_visual_group,
         "visual_group_vc": visual_group_vc, "visual_group_spill": visual_group_spill,
+        "junctions": junction_pressure(junctions_df, hour),
     }
 
 
-def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
+def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None, junctions_df=None):
     # Include every graph node, including explicit KML Point nodes that are
     # not yet connected to a road. This keeps the map aligned with Google Earth.
     nodes = [
@@ -494,8 +540,9 @@ def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
         return ((lon-min_lon)/(max_lon-min_lon)*W,
                 H-(lat-min_lat)/(max_lat-min_lat)*H)
 
-    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df)
+    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df, junctions_df)
     selected, gate_q, gate_wait = state["selected"], state["gate_q"], state["gate_wait"]
+    junction_state = state["junctions"]
     spillback_links = state["spillback_links"]
     physical_to_visual_group = state["physical_to_visual_group"]
     visual_group_vc, visual_group_spill = state["visual_group_vc"], state["visual_group_spill"]
@@ -543,7 +590,10 @@ def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
             avg_w, peak_w = gate_wait.get(node, (0.0, 0.0))
             title = f"{node} | queue {q:.0f} trucks | avg wait {avg_w:.1f} min | peak wait {peak_w:.1f} min"
         elif node in JUNCTIONS:
-            color = "#7b61a8"; radius = 8; title = f"{node} | junction"
+            j = junction_state[node]
+            color = JUNCTION_STATUS_COLORS[j["status"]]
+            radius = 9 + min(j["queue"] / 25, 8)
+            title = junction_tooltip(node, j, " | ")
         elif node in terminal_set:
             color = "#4b87c5"; radius = 7; title = node
         else:
@@ -567,7 +617,8 @@ def build_network_map(graph, road_hourly, queue_stock, hour, gates_df=None):
     <span style="color:#5caf3a">A ≤0.15</span><span style="color:#9ac34a">B 0.15–0.27</span>
     <span style="color:#f0a23a">C 0.27–0.43</span><span style="color:#e76f2f">D 0.43–0.64</span>
     <span style="color:#d73027">E 0.64–1.00</span><span style="color:#7f1d1d">F &gt;1.00 / congestion</span>
-    <span>Gate circles = queue stock</span><span>Gate tooltip = queue time</span></div></div>'''
+    <span>Gate circles = queue stock</span><span>Gate tooltip = queue time</span>
+    <span>Junctions: <b style="color:#22a06b">Low</b> · <b style="color:#e0b100">Moderate</b> · <b style="color:#f28c28">High</b> · <b style="color:#d64545">Congested</b> (V/C &lt;0.70 / 0.85 / 1.00 / &gt;1.00)</span></div></div>'''
 
 MAP_BACKGROUNDS = {
     "Satellite": {
@@ -586,10 +637,11 @@ MAP_BACKGROUNDS = {
 LOS_COLORS = {"A":"#5caf3a","B":"#9ac34a","C":"#f0a23a","D":"#e76f2f","E":"#d73027","F":"#7f1d1d"}
 
 
-def build_network_figure(graph, road_hourly, queue_stock, hour, gates_df=None, background="Satellite"):
+def build_network_figure(graph, road_hourly, queue_stock, hour, gates_df=None, background="Satellite", junctions_df=None):
     """Interactive network map on a real basemap (satellite or street tiles)."""
-    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df)
+    state = network_pressure(graph, road_hourly, queue_stock, hour, gates_df, junctions_df)
     selected, gate_q, gate_wait = state["selected"], state["gate_q"], state["gate_wait"]
+    junction_state = state["junctions"]
     spillback_links = state["spillback_links"]
     group_of, group_vc = state["physical_to_visual_group"], state["visual_group_vc"]
     group_spill = state["visual_group_spill"]
@@ -637,7 +689,9 @@ def build_network_figure(graph, road_hourly, queue_stock, hour, gates_df=None, b
             groups["Gates"].append((node, d, queue_to_hex(q), 14 + min(q / 20.0, 16),
                                     f"<b>{node}</b><br>Queue {q:.0f} trucks<br>Avg wait {avg_w:.1f} min · peak {peak_w:.1f} min"))
         elif node in JUNCTIONS:
-            groups["Junctions"].append((node, d, "#a78bfa", 11, f"<b>{node}</b><br>Junction"))
+            j = junction_state[node]
+            groups["Junctions"].append((node, d, JUNCTION_STATUS_COLORS[j["status"]], 13 + min(j["queue"] / 20.0, 14),
+                                        "<b>" + junction_tooltip(node, j, "<br>").replace("<br>", "</b><br>", 1)))
         elif node in terminal_set:
             groups["Terminals"].append((node, d, "#60a5fa", 11, f"<b>{html.escape(node)}</b><br>Terminal / destination"))
         else:
@@ -662,6 +716,9 @@ def build_network_figure(graph, road_hourly, queue_stock, hour, gates_df=None, b
     for color, label in [("#22a06b","< 25"),("#e0b100","25–75"),("#f28c28","75–150"),("#d64545","≥ 150")]:
         fig.add_trace(go.Scattermap(lon=[None], lat=[None], mode="markers", marker=dict(size=12, color=color),
                                     name=f"{label} trucks", legendgroup="gate", legendgrouptitle_text="Gate queue"))
+    for status, label in [("Low","V/C < 0.70"),("Moderate","0.70–0.85"),("High","0.85–1.00"),("Congested","> 1.00")]:
+        fig.add_trace(go.Scattermap(lon=[None], lat=[None], mode="markers", marker=dict(size=12, color=JUNCTION_STATUS_COLORS[status]),
+                                    name=f"{status}  {label}", legendgroup="junction", legendgrouptitle_text="Junction"))
 
     min_lon, max_lon, min_lat, max_lat = min(lons), max(lons), min(lats), max(lats)
     span_lon = max((max_lon - min_lon) * 1.25, 0.002)
@@ -751,17 +808,19 @@ with col2:
 st.subheader("Al-Khumra logistics corridor")
 st.caption("Trucks travelling directly between the Al-Khumra corridor and the port. They are part of the daily demand, not additional trucks: "
            "for each terminal, the Al-Khumra trucks use the gates defined here and the remaining trucks follow the general gate allocation above. "
-           "Define each terminal either as a share of its daily trucks or as trucks/day (truck visits: one entry + one exit). Cargo mix and appointment cap apply as for any other truck.")
+           "Define, for each terminal, how many of its daily trucks ENTER the port from Al-Khumra and how many LEAVE towards Al-Khumra, either as a share of the terminal's trucks or as trucks/day. "
+           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). Cargo mix and appointment cap apply as for any other truck.")
 ak_editor=st.data_editor(al_khumra_df(model.AL_KHUMRA_FLOWS),width="stretch",num_rows="fixed",hide_index=True,disabled=["Terminal"],
     column_config={"Input mode":st.column_config.SelectboxColumn("Input mode",options=list(AK_MODE_LABELS.values()),required=True),
-                   "Value":st.column_config.NumberColumn("Value",min_value=0.0,step=1.0,help="% of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Entry value":st.column_config.NumberColumn("Entry value",min_value=0.0,step=1.0,help="Trucks entering the port from Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Exit value":st.column_config.NumberColumn("Exit value",min_value=0.0,step=1.0,help="Trucks leaving the port towards Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
                    "Entry gate":st.column_config.SelectboxColumn("Entry gate",options=GATES,required=True),
                    "Exit gate":st.column_config.SelectboxColumn("Exit gate",options=GATES,required=True)},key="al_khumra_editor")
 terminal_trucks_day=model.allocate_integer_counts(int(trucks_per_day),terminal_shares) if not any("Terminal shares" in e for e in flow_errors) else {}
 al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes); flow_errors+=ak_errors
-ak_total=int(ak_summary["Al-Khumra trucks/day"].sum())
+ak_in=int(ak_summary["Enter from Al-Khumra"].sum()); ak_out=int(ak_summary["Leave to Al-Khumra"].sum())
 st.dataframe(ak_summary,width="stretch",hide_index=True)
-if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_total:,} of {int(trucks_per_day):,} trucks/day; the other {int(trucks_per_day)-ak_total:,} trucks/day follow the general gate allocation.")
+if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_in:,} of {int(trucks_per_day):,} trucks/day enter from Al-Khumra and {ak_out:,} leave towards it; all other entries and exits follow the general gate allocation.")
 
 if mode=="Advanced":
     st.subheader("Processing times")
@@ -928,10 +987,10 @@ if not spillback.empty:
 st.subheader("Network congestion map")
 map_background=st.radio("Map background",[*MAP_BACKGROUNDS,"Schematic"],horizontal=True,key="map_background",help="Satellite and street tiles load from Esri / CARTO in your browser and need internet access. Schematic is the offline diagram.")
 if map_background=="Schematic":
-    show_html(build_network_map(graph,road_hourly,queue_stock,hour,gates),height=690)
+    show_html(build_network_map(graph,road_hourly,queue_stock,hour,gates,junction_results),height=690)
 else:
-    st.plotly_chart(build_network_figure(graph,road_hourly,queue_stock,hour,gates,map_background),width="stretch",config={"displaylogo":False,"scrollZoom":True})
-st.caption("Road colours use the V/C LOS bands from the provided reference table as a screening classification: A/B/C/D/E/F = ≤0.15 / 0.27 / 0.43 / 0.64 / 1.00 / >1.00. The model capacity itself remains the explicit lane-capacity assumption; the reference table is not used to extrapolate capacity from 60 km/h to 30 km/h. Gate circles represent queue stock. IN and OUT gate lanes are separate resources.")
+    st.plotly_chart(build_network_figure(graph,road_hourly,queue_stock,hour,gates,map_background,junction_results),width="stretch",config={"displaylogo":False,"scrollZoom":True})
+st.caption("Road colours use the V/C LOS bands from the provided reference table as a screening classification: A/B/C/D/E/F = ≤0.15 / 0.27 / 0.43 / 0.64 / 1.00 / >1.00. The model capacity itself remains the explicit lane-capacity assumption; the reference table is not used to extrapolate capacity from 60 km/h to 30 km/h. Gate circles represent queue stock. IN and OUT gate lanes are separate resources. Junction circles (N01–N03) are coloured by their V/C in the selected hour, with the same Low / Moderate / High / Congested bands as the junction bottleneck table; their size and tooltip show the trucks waiting to cross.")
 
 if st.session_state.base_result is not None:
     st.subheader("Base vs Scenario")
@@ -1216,12 +1275,24 @@ gate_summary=gates.groupby(["gate","operation"]).size().unstack(fill_value=0).re
 
 if "origin" in trucks.columns and (trucks["origin"]==model.AL_KHUMRA_ORIGIN).any():
     st.subheader("Gate flows by origin — Al-Khumra corridor vs other traffic")
-    by_origin=gates.merge(trucks[["truck_id","origin","terminal"]],on="truck_id",how="left")
-    by_origin["origin"]=by_origin["origin"].map({model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"})
+    ak_cols=[c for c in ["al_khumra_entry","al_khumra_exit"] if c in trucks.columns]
+    by_origin=gates.merge(trucks[["truck_id","origin","terminal",*ak_cols]],on="truck_id",how="left")
+    if len(ak_cols)==2:
+        # Entry activities use the entry tag, exit activities the exit tag.
+        is_ak=np.where(by_origin["operation"]=="ENTRY",by_origin["al_khumra_entry"],by_origin["al_khumra_exit"]).astype(bool)
+    else:
+        is_ak=(by_origin["origin"]==model.AL_KHUMRA_ORIGIN).to_numpy()
+    by_origin["origin"]=np.where(is_ak,"Al-Khumra","Other")
     flow_tbl=by_origin.groupby(["gate","operation","origin"]).size().unstack(fill_value=0)
     wait_tbl=by_origin.groupby(["gate","operation","origin"])["wait_min"].mean().unstack().round(1).add_suffix(" — avg queue time (min)")
     st.dataframe(flow_tbl.join(wait_tbl),width="stretch")
-    st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")
+    if len(ak_cols)==2:
+        per_terminal=trucks.groupby("terminal").agg(**{"Trucks":("truck_id","size"),"Enter from Al-Khumra":("al_khumra_entry","sum"),
+                                                     "Leave to Al-Khumra":("al_khumra_exit","sum")})
+        per_terminal["Round trip (both)"]=trucks[trucks.al_khumra_entry & trucks.al_khumra_exit].groupby("terminal").size().reindex(per_terminal.index,fill_value=0)
+        st.dataframe(per_terminal,width="stretch")
+    else:
+        st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")
     st.caption("Al-Khumra and other trucks share the same gate lanes and FIFO queue; gate queue stock is therefore reported per gate, not split by origin. Queue time by origin is the average wait before gate processing.")
 
 st.subheader("Export results")
@@ -1234,5 +1305,5 @@ st.subheader("Hourly arrivals")
 trucks["arrival_hour"]=(trucks.arrival_min//60).astype(int); hourly=trucks.groupby("arrival_hour").size().reindex(range(24),fill_value=0); st.bar_chart(hourly)
 
 with st.expander("Truck-level results"):
-    display_cols=[c for c in ["truck_id","terminal","cargo","origin","entry_gate","exit_gate","arrival_min","entry_path","exit_path","total_time_min","entry_gate_wait_min","exit_gate_wait_min"] if c in trucks.columns]
+    display_cols=[c for c in ["truck_id","terminal","cargo","origin","al_khumra_entry","al_khumra_exit","entry_gate","exit_gate","arrival_min","entry_path","exit_path","total_time_min","entry_gate_wait_min","exit_gate_wait_min"] if c in trucks.columns]
     st.dataframe(trucks[display_cols],width="stretch")
