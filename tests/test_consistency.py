@@ -175,7 +175,9 @@ SENSITIVITY_CASES = {
         t: {"FULL": 30.0, "EMPTY": 30.0} for t in model.TERMINAL_PROCESS_MIN}),
     "al_khumra_flows": dict(al_khumra_flows={
         **model.AL_KHUMRA_FLOWS,
-        "RSGT": {"mode": "share", "value": 0.30, "entry_gate": "G9", "exit_gate": "G8"}}),
+        "RSGT": {"mode": "share", "value": 0.30, "entry_gate": "G9", "exit_gate": "G8"}},
+        al_khumra_lanes={**model.AL_KHUMRA_LANES, "G9": {"entry": 1, "exit": 0}, "G8": {"entry": 0, "exit": 1}}),
+    "al_khumra_lanes": dict(al_khumra_lanes={**model.AL_KHUMRA_LANES, "G4": {"entry": 1, "exit": 0}}),
     # A detour G4 > N04 > N05 > N04 > MPT2 instead of the direct G4 > N04 > MPT2.
     "route_overrides": dict(route_overrides={
         ("G4", "MPT2"): ["G4", "N04", "N05", "N04", "MPT2"]}),

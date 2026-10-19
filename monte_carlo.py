@@ -458,8 +458,12 @@ def _simulate_batch(cfg, rng, batch):
     # exit selections are nested (as in main.apply_al_khumra_flows).
     al_khumra_trucks = np.zeros(batch)
     al_khumra_empty_trucks = np.zeros(batch)
+    al_khumra_empty_shortfall = np.zeros(batch)
+    shortfall = {}
     al_khumra_entry_trucks = np.zeros(batch)
     al_khumra_exit_trucks = np.zeros(batch)
+    entry_on_ak_lanes = np.zeros((batch, trucks), dtype=bool)
+    exit_on_ak_lanes = np.zeros((batch, trucks), dtype=bool)
     ak = cfg.get("al_khumra")
     if ak is not None:
         keys = ak["rng"].random((batch, trucks))
@@ -490,26 +494,51 @@ def _simulate_batch(cfg, rng, batch):
                         f"Al-Khumra {direction} flow for {cfg['terminals'][t]} ({int(n.max()):,} trucks/day) "
                         f"exceeds the terminal's daily trucks ({int(n_terminal.min()):,})."
                     )
-                n_empty = None if empty_share is None else np.floor(empty_share * n + 0.5).astype(np.int64)
+                if empty_share is None:
+                    takes = {None: n}
+                else:
+                    n_empty = np.floor(empty_share * n + 0.5).astype(np.int64)
+                    # Configuration error if the terminal cannot meet it on
+                    # average (same rule as main.apply_al_khumra_flows).
+                    base_empty = cfg["cargo_shares"][t][1]
+                    for label, need, expected in (
+                        ("EMPTY", n_empty, n_terminal * base_empty),
+                        ("FULL", n - n_empty, n_terminal * (1.0 - base_empty)),
+                    ):
+                        bad = need > np.floor(expected + 0.5)
+                        if bad.any():
+                            s_bad = int(np.argmax(bad))
+                            raise ValueError(
+                                f"Al-Khumra {cfg['terminals'][t]}: {int(need[s_bad]):,} {label} trucks/day are needed "
+                                f"({empty_share:.0%} empty of {int(n[s_bad]):,}), but the terminal only has about "
+                                f"{expected[s_bad]:,.0f} {label} trucks/day. "
+                                f"Lower the Al-Khumra volume or adjust its empty share."
+                            )
+                    # A scenario can be short of empty (or full) trucks by
+                    # chance: take all of them and complete with the other
+                    # cargo, and count the shortfall.
+                    available_empty = ranked[0][0].sum(axis=1)
+                    available_full = ranked[1][0].sum(axis=1)
+                    take_empty = np.minimum(n_empty, available_empty)
+                    take_full = np.minimum(n - take_empty, available_full)
+                    take_empty = n - take_full
+                    gap = n_empty - take_empty
+                    previous = np.broadcast_to(shortfall.get(t, 0), gap.shape)
+                    shortfall[t] = np.where(np.abs(gap) > np.abs(previous), gap, previous)
+                    takes = {"EMPTY": take_empty, "FULL": take_full}
                 chosen = np.zeros_like(mask)
                 for group_mask, label, k, sorted_k in ranked:
-                    need = n if label is None else (n_empty if label == "EMPTY" else n - n_empty)
-                    available = group_mask.sum(axis=1)
-                    if (need > available).any():
-                        s_bad = int(np.argmax(need > available))
-                        raise ValueError(
-                            f"Al-Khumra {cfg['terminals'][t]}: {int(need[s_bad]):,} {label} trucks/day are needed "
-                            f"({empty_share:.0%} empty of {int(n[s_bad]):,}), but the terminal only has "
-                            f"{int(available[s_bad]):,} {label} trucks/day in a scenario. "
-                            f"Lower the Al-Khumra volume or adjust its empty share."
-                        )
+                    need = takes[label]
                     threshold = np.where(
                         need > 0, sorted_k[np.arange(batch), np.maximum(need - 1, 0)], -np.inf
                     )
                     chosen |= group_mask & (k <= threshold[:, None])
                 selected[direction] = chosen
+            al_khumra_empty_shortfall += np.abs(shortfall.get(t, 0))
             entry_gate[selected["entry"]] = ak_entry
             exit_gate[selected["exit"]] = ak_exit
+            entry_on_ak_lanes |= selected["entry"]
+            exit_on_ak_lanes |= selected["exit"]
             al_khumra_trucks += (selected["entry"] | selected["exit"]).sum(axis=1)
             al_khumra_empty_trucks += ((selected["entry"] | selected["exit"]) & (cargo == 1)).sum(axis=1)
             al_khumra_entry_trucks += selected["entry"].sum(axis=1)
@@ -517,12 +546,14 @@ def _simulate_batch(cfg, rng, batch):
 
     # ---- Entry gates -----------------------------------------
     entry_service = cfg["service_min"][0][cargo]
+    # Al-Khumra trucks queue at their gate's reserved lanes ("<gate>@AK").
+    n_real_gates = len(cfg["gates"])
     entry_finish, entry_kpis = _gate_stage(
-        entry_gate,
+        entry_gate + n_real_gates * entry_on_ak_lanes,
         arrival,
         entry_service,
-        cfg["gates"],
-        cfg["entry_lanes"],
+        cfg["stage_gates"],
+        cfg["stage_entry_lanes"],
         cfg["snapshot_times"],
         presorted=True,
     )
@@ -545,11 +576,11 @@ def _simulate_batch(cfg, rng, batch):
     )
     exit_service = cfg["service_min"][1][cargo]
     _, exit_kpis = _gate_stage(
-        exit_gate,
+        exit_gate + n_real_gates * exit_on_ak_lanes,
         exit_arrival,
         exit_service,
-        cfg["gates"],
-        cfg["exit_lanes"],
+        cfg["stage_gates"],
+        cfg["stage_exit_lanes"],
         cfg["snapshot_times"],
     )
 
@@ -568,6 +599,7 @@ def _simulate_batch(cfg, rng, batch):
         "last_entry_hour": arrival[:, -1] / 60.0,
         "al_khumra_trucks": al_khumra_trucks,
         "al_khumra_empty_trucks": al_khumra_empty_trucks,
+        "al_khumra_empty_shortfall": al_khumra_empty_shortfall,
         "al_khumra_entry_trucks": al_khumra_entry_trucks,
         "al_khumra_exit_trucks": al_khumra_exit_trucks,
     }
@@ -592,6 +624,29 @@ def _percentile_summary(df, columns):
     return metrics
 
 
+AK_LANES_SUFFIX = "@AK"
+
+
+def _combine_lane_kpis(general, reserved):
+    """Gate KPIs from its general lanes and its reserved Al-Khumra lanes:
+    queue stock profiles are added, waits pooled."""
+    if reserved is None:
+        return general
+    if general is None:
+        return reserved
+    profile = general["stock_profile"] + reserved["stock_profile"]
+    return {
+        "trucks": general["trucks"] + reserved["trucks"],
+        "peak_stock": profile.max(axis=1),
+        "stock_profile": profile,
+        "wait_sum": general["wait_sum"] + reserved["wait_sum"],
+        "wait_max": np.maximum(
+            np.where(general["trucks"] > 0, general["wait_max"], -np.inf),
+            np.where(reserved["trucks"] > 0, reserved["wait_max"], -np.inf),
+        ),
+    }
+
+
 def _batch_rows(cfg, entry_kpis, exit_kpis, marshalling, batch, first_sim, seed):
     gates = cfg["gates"]
     zeros = np.zeros(batch)
@@ -612,8 +667,14 @@ def _batch_rows(cfg, entry_kpis, exit_kpis, marshalling, batch, first_sim, seed)
         gate_wait_max = zeros.copy()
         gate_trucks = zeros.copy()
         for operation, kpis in (("ENTRY", entry_kpis), ("EXIT", exit_kpis)):
-            k = kpis.get(gate)
+            k_ak = kpis.get(f"{gate}{AK_LANES_SUFFIX}")
+            k = _combine_lane_kpis(kpis.get(gate), k_ak)
             prefix = f"{gate}_{operation}"
+            if k_ak is not None:
+                n_ak = k_ak["trucks"]
+                data[f"peak_queue_{prefix}_al_khumra"] = k_ak["peak_stock"]
+                data[f"avg_wait_{prefix}_al_khumra"] = np.divide(k_ak["wait_sum"], n_ak, out=zeros.copy(), where=n_ak > 0)
+                data[f"peak_wait_{prefix}_al_khumra"] = np.where(n_ak > 0, k_ak["wait_max"], 0.0)
             if k is None:
                 data[f"peak_queue_{prefix}"] = zeros
                 data[f"avg_wait_{prefix}"] = zeros
@@ -689,6 +750,7 @@ def run_monte_carlo(
     batch_size=None,
     progress_callback=None,
     al_khumra_flows=None,
+    al_khumra_lanes=None,
     **kwargs,
 ):
     """
@@ -744,6 +806,11 @@ def run_monte_carlo(
         graph = _load_graph(model)
     if al_khumra_flows is None:
         al_khumra_flows = getattr(model, "AL_KHUMRA_FLOWS", {})
+    if al_khumra_lanes is None:
+        al_khumra_lanes = getattr(model, "AL_KHUMRA_LANES", {})
+
+    def reserved_lanes(gate, direction):
+        return int((al_khumra_lanes.get(gate) or {}).get(direction, 0))
     # Same rules and validation as main.py (subset of demand, per terminal).
     al_khumra_active = {
         t: dict(cfg) for t, cfg in al_khumra_flows.items()
@@ -795,9 +862,35 @@ def run_monte_carlo(
                 raise ValueError(
                     f"Al-Khumra {terminal}: {key} {gate} has 0 {lane_key} lanes configured."
                 )
+            if reserved_lanes(gate, lane_key) <= 0:
+                raise ValueError(
+                    f"Al-Khumra {terminal}: {key} {gate} has no {lane_key} lanes reserved for "
+                    f"Al-Khumra traffic. Reserve at least one {gate} {lane_key} lane."
+                )
             if gate not in gates:
                 gates.append(gate)
     gate_index = {g: i for i, g in enumerate(gates)}
+
+    # Reserved Al-Khumra lanes (same rules as main.validate_configuration).
+    for gate, cfg in al_khumra_lanes.items():
+        if gate not in gate_lanes:
+            raise ValueError(f"Unknown gate in Al-Khumra lanes: {gate}")
+        for direction in ("entry", "exit"):
+            reserved, total = reserved_lanes(gate, direction), int(gate_lanes[gate].get(direction, 0))
+            if reserved < 0 or reserved > total:
+                raise ValueError(
+                    f"{gate} has {reserved} {direction} lanes reserved for Al-Khumra but only "
+                    f"{total} {direction} lanes in total."
+                )
+    for rules, direction in ((entry_access_rules, "entry"), (exit_gate_rules, "exit")):
+        for (terminal, cargo), options in rules.items():
+            for gate, share in options:
+                total = int(gate_lanes.get(gate, {}).get(direction, 0))
+                if float(share) > 0 and total > 0 and total - reserved_lanes(gate, direction) <= 0:
+                    raise ValueError(
+                        f"{terminal} {cargo} {direction} flow is assigned to {gate}, but all of {gate}'s "
+                        f"{direction} lanes are reserved for Al-Khumra."
+                    )
 
     for gate, lanes_cfg in gate_lanes.items():
         for operation in ("entry", "exit"):
@@ -927,11 +1020,23 @@ def run_monte_carlo(
         "exit_route_cum": exit_route_cum.reshape(-1, max_k),
         "terminal_min": terminal_min,
         "service_min": service_min,
+        # General lanes per gate (total minus lanes reserved for Al-Khumra).
         "entry_lanes": {
-            g: int(gate_lanes.get(g, {}).get("entry", 0)) for g in gates
+            g: int(gate_lanes.get(g, {}).get("entry", 0)) - reserved_lanes(g, "entry") for g in gates
         },
         "exit_lanes": {
-            g: int(gate_lanes.get(g, {}).get("exit", 0)) for g in gates
+            g: int(gate_lanes.get(g, {}).get("exit", 0)) - reserved_lanes(g, "exit") for g in gates
+        },
+        # Reserved Al-Khumra lanes are simulated as a separate queue
+        # "<gate>@AK" and added to the gate totals in _batch_rows.
+        "stage_gates": gates + [f"{g}{AK_LANES_SUFFIX}" for g in gates],
+        "stage_entry_lanes": {
+            **{g: int(gate_lanes.get(g, {}).get("entry", 0)) - reserved_lanes(g, "entry") for g in gates},
+            **{f"{g}{AK_LANES_SUFFIX}": reserved_lanes(g, "entry") for g in gates},
+        },
+        "stage_exit_lanes": {
+            **{g: int(gate_lanes.get(g, {}).get("exit", 0)) - reserved_lanes(g, "exit") for g in gates},
+            **{f"{g}{AK_LANES_SUFFIX}": reserved_lanes(g, "exit") for g in gates},
         },
         # Al-Khumra corridor: (mode, entry value, exit value, entry gate,
         # exit gate) per terminal, with its own random stream so the main
@@ -998,11 +1103,12 @@ def run_monte_carlo(
     gate_capacities = {}
     for gate in gates:
         for operation, lanes in (
-            ("ENTRY", cfg["entry_lanes"][gate]),
-            ("EXIT", cfg["exit_lanes"][gate]),
+            ("ENTRY", cfg["entry_lanes"][gate] + reserved_lanes(gate, "entry")),
+            ("EXIT", cfg["exit_lanes"][gate] + reserved_lanes(gate, "exit")),
         ):
             gate_capacities[f"{gate} {operation}"] = {
                 "lanes": lanes,
+                "al_khumra_lanes": reserved_lanes(gate, operation.lower()),
                 "configured": True,
             }
 
@@ -1030,6 +1136,7 @@ def run_monte_carlo(
             "route_randomization": route_randomization,
             "seed": int(seed),
             "al_khumra_flows": {k: dict(v) for k, v in al_khumra_flows.items()},
+            "al_khumra_lanes": {k: dict(v) for k, v in al_khumra_lanes.items()},
             "roads_simulated": False,
             "junctions_simulated": False,
         },
