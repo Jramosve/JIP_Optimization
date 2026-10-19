@@ -8,8 +8,32 @@ import streamlit as st
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
 
+import importlib
+import os
+
 import main as model
 import monte_carlo
+
+
+def reload_if_changed(module):
+    """Reload a model module when its file changed on disk.
+
+    Streamlit reruns this script on every interaction but keeps imported
+    modules in memory. After a deploy (e.g. merging a PR on Streamlit Cloud)
+    the page could run new dashboard code against the previous main.py and
+    fail with "module 'main' has no attribute ...". A module is reloaded the
+    first time this check sees it in the process, and again whenever its
+    file's modification time changes.
+    """
+    mtime = os.path.getmtime(module.__file__)
+    if getattr(module, "_dashboard_loaded_mtime", None) != mtime:
+        module = importlib.reload(module)
+        module._dashboard_loaded_mtime = mtime
+    return module
+
+
+model = reload_if_changed(model)
+monte_carlo = reload_if_changed(monte_carlo)
 
 st.set_page_config(page_title="Jeddah Islamic Port - Traffic Model", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""<style>
