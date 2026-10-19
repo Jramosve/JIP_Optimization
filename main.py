@@ -384,6 +384,12 @@ EXIT_GATE_RULES = {
 #   entry_value = trucks that ENTER the port from Al-Khumra (use entry_gate)
 #   exit_value  = trucks that LEAVE the port to Al-Khumra (use exit_gate)
 #   A single "value" (older configurations) sets both entry and exit.
+#   empty_share = share of the terminal's Al-Khumra trucks that are EMPTY
+#                 (0-1), or None to pick them regardless of cargo. The trucks
+#                 are chosen among the terminal's existing EMPTY and FULL
+#                 trucks, so the terminal's overall Full/Empty mix is
+#                 unchanged; only its general (non Al-Khumra) traffic becomes
+#                 correspondingly fuller.
 #
 # Entry and exit selections are nested: trucks are ranked once per terminal
 # and the first entry_value / exit_value of that ranking are tagged, so the
@@ -398,11 +404,44 @@ AL_KHUMRA_ORIGIN = "AL_KHUMRA"
 GENERAL_ORIGIN = "GENERAL"
 AL_KHUMRA_MODES = ("share", "absolute")
 
+# Gate lanes reserved for Al-Khumra traffic, per gate and direction. They are
+# part of GATE_LANES (e.g. G9 exit 4 lanes with 1 reserved -> 1 Al-Khumra lane
+# + 3 general lanes) and are exclusive both ways: Al-Khumra trucks only use
+# their reserved lanes, other trucks only use the general lanes. Every gate
+# and direction used by an active Al-Khumra flow must have reserved lanes.
+AL_KHUMRA_LANES = {
+    "G1": {"entry": 0, "exit": 0},
+    "G4": {"entry": 0, "exit": 0},
+    "G6": {"entry": 0, "exit": 0},
+    "G8": {"entry": 0, "exit": 0},
+    "G9": {"entry": 0, "exit": 0},
+}
+
+# Filled by apply_al_khumra_flows on every run (see there).
+AL_KHUMRA_EMPTY_SHORTFALL = {}
+
+AL_KHUMRA_LANE_GROUP = "AL_KHUMRA"
+GENERAL_LANE_GROUP = "GENERAL"
+
+
+def al_khumra_reserved_lanes(gate, direction, reserved=None):
+    """Lanes reserved for Al-Khumra at a gate ("entry" or "exit")."""
+    reserved = AL_KHUMRA_LANES if reserved is None else reserved
+    return int((reserved.get(gate) or {}).get(direction, 0))
+
+
+def general_lanes(gate, direction, lanes=None, reserved=None):
+    """Lanes available to non Al-Khumra traffic at a gate."""
+    lanes = GATE_LANES if lanes is None else lanes
+    total = int((lanes.get(gate) or {}).get(direction, 0))
+    return total - al_khumra_reserved_lanes(gate, direction, reserved)
+
+
 AL_KHUMRA_FLOWS = {
-    "RSGT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "DPW": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "LOGISTICS": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "RSGT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "DPW": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "LOGISTICS": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
 }
 
 
@@ -1404,6 +1443,21 @@ def al_khumra_value(cfg, direction):
     return float(cfg[key]) if key in cfg else float(cfg.get("value", 0.0))
 
 
+def al_khumra_empty_share(cfg):
+    """Share of EMPTY trucks among a terminal's Al-Khumra trucks, or None
+    when they are picked regardless of cargo."""
+    value = cfg.get("empty_share")
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return float(value)
+
+
+def al_khumra_empty_count(n, empty_share):
+    """EMPTY trucks among n Al-Khumra trucks (rounded half-up). Both this and
+    n minus it are non-decreasing in n, which keeps selections nested."""
+    return int(math.floor(float(empty_share) * int(n) + 0.5))
+
+
 def al_khumra_active_flows(flows=None):
     """Terminals with a non-zero Al-Khumra entry or exit flow."""
     flows = AL_KHUMRA_FLOWS if flows is None else flows
@@ -1435,6 +1489,7 @@ def apply_al_khumra_flows(trucks, flows=None, seed=None):
     """
     flows = AL_KHUMRA_FLOWS if flows is None else flows
     seed = RANDOM_SEED if seed is None else seed
+    shortfall = {}
     by_terminal = {}
     for i, truck in enumerate(trucks):
         truck["origin"] = GENERAL_ORIGIN
@@ -1455,14 +1510,62 @@ def apply_al_khumra_flows(trucks, flows=None, seed=None):
         # to leave towards it.
         order = list(indices)
         random.Random(f"al_khumra:{seed}:{terminal}").shuffle(order)
-        for i in order[:counts["entry"]]:
+        empty_share = al_khumra_empty_share(cfg)
+        if empty_share is None:
+            def pick(n):
+                return order[:n]
+        else:
+            # Same ranking, split by cargo: take the first EMPTY and the
+            # first FULL trucks in the required proportion. Cargo is never
+            # changed, so the terminal's Full/Empty mix stays as configured.
+            by_cargo = {
+                c: [i for i in order if trucks[i]["cargo"] == c]
+                for c in ("EMPTY", "FULL")
+            }
+
+            terminal_empty_share = float(CARGO_SHARES.get(terminal, {}).get("EMPTY", 0.0))
+
+            def pick(n):
+                need = {"EMPTY": al_khumra_empty_count(n, empty_share)}
+                need["FULL"] = n - need["EMPTY"]
+                # A request the terminal cannot meet on average is a
+                # configuration error.
+                expected = {"EMPTY": len(indices) * terminal_empty_share}
+                expected["FULL"] = len(indices) - expected["EMPTY"]
+                for cargo, k in need.items():
+                    if k > int(math.floor(expected[cargo] + 0.5)):
+                        raise ValueError(
+                            f"Al-Khumra {terminal}: {k:,} {cargo} trucks/day are needed "
+                            f"({empty_share:.0%} empty of {n:,}), but {terminal} only has about "
+                            f"{expected[cargo]:,.0f} {cargo} trucks/day. "
+                            f"Lower the Al-Khumra volume or adjust its empty share."
+                        )
+                # Cargo is drawn at random, so on a given day the terminal can
+                # have slightly fewer empty (or full) trucks than on average:
+                # take all of them and complete with the other cargo. The
+                # shortfall is reported (al_khumra_empty_shortfall).
+                take_empty = min(need["EMPTY"], len(by_cargo["EMPTY"]))
+                take_full = n - take_empty
+                if take_full > len(by_cargo["FULL"]):
+                    take_full = len(by_cargo["FULL"])
+                    take_empty = n - take_full
+                gap = need["EMPTY"] - take_empty
+                if abs(gap) > abs(shortfall.get(terminal, 0)):
+                    shortfall[terminal] = gap
+                return by_cargo["EMPTY"][:take_empty] + by_cargo["FULL"][:take_full]
+        for i in pick(counts["entry"]):
             trucks[i]["origin"] = AL_KHUMRA_ORIGIN
             trucks[i]["al_khumra_entry"] = True
             trucks[i]["entry_gate"] = cfg["entry_gate"]
-        for i in order[:counts["exit"]]:
+        for i in pick(counts["exit"]):
             trucks[i]["origin"] = AL_KHUMRA_ORIGIN
             trucks[i]["al_khumra_exit"] = True
             trucks[i]["exit_gate"] = cfg["exit_gate"]
+    # Al-Khumra trucks taken full instead of empty because, on this day, the
+    # terminal did not have enough empty trucks (positive) or full ones
+    # (negative). Zero when the empty share was met exactly.
+    AL_KHUMRA_EMPTY_SHORTFALL.clear()
+    AL_KHUMRA_EMPTY_SHORTFALL.update({t: v for t, v in shortfall.items() if v})
     return trucks
 
 
@@ -1759,33 +1862,44 @@ class JunctionManager:
 class GateManager:
     def __init__(self, env):
         self.env = env
+        # General lanes, and lanes reserved for Al-Khumra traffic (exclusive).
         self.resources = {}
+        self.al_khumra_resources = {}
         for gate, cfg in GATE_LANES.items():
             for operation in ("ENTRY", "EXIT"):
-                lanes = int(cfg["entry" if operation == "ENTRY" else "exit"])
+                direction = "entry" if operation == "ENTRY" else "exit"
+                lanes = general_lanes(gate, direction)
                 if lanes > 0:
                     self.resources[(gate, operation)] = simpy.Resource(env, capacity=lanes)
+                reserved = al_khumra_reserved_lanes(gate, direction)
+                if reserved > 0:
+                    self.al_khumra_resources[(gate, operation)] = simpy.Resource(env, capacity=reserved)
         self.activities = []
         self.queue_snapshots = []
+        self.al_khumra_queue_snapshots = []
 
     def snapshot_queues(self):
-        for (gate, operation), resource in self.resources.items():
-            self.queue_snapshots.append({
-                "time_min": self.env.now,
-                "hour": int(self.env.now // 60),
-                "gate": gate,
-                "operation": operation,
-                "queue": len(resource.queue),
-                "busy": resource.count,
-                "capacity_lanes": resource.capacity,
-            })
+        for resources, snapshots in (
+            (self.resources, self.queue_snapshots),
+            (self.al_khumra_resources, self.al_khumra_queue_snapshots),
+        ):
+            for (gate, operation), resource in resources.items():
+                snapshots.append({
+                    "time_min": self.env.now,
+                    "hour": int(self.env.now // 60),
+                    "gate": gate,
+                    "operation": operation,
+                    "queue": len(resource.queue),
+                    "busy": resource.count,
+                    "capacity_lanes": resource.capacity,
+                })
 
     def monitor_queues(self):
         while self.env.now <= 24 * 60:
             self.snapshot_queues()
             yield self.env.timeout(QUEUE_SNAPSHOT_INTERVAL_MIN)
 
-    def process(self, truck_id, gate, operation, terminal, cargo):
+    def process(self, truck_id, gate, operation, terminal, cargo, al_khumra=False):
         service_sec = float(
             GATE_TIMES_SEC[
                 ("FULL_ENTRY" if cargo == "FULL" else "EMPTY_ENTRY")
@@ -1794,10 +1908,14 @@ class GateManager:
             ]
         )
         key = (gate, operation)
-        if key not in self.resources:
-            raise RuntimeError(f"Gate {gate} has no lanes configured for {operation}.")
+        # Al-Khumra trucks only use the lanes reserved for them, and other
+        # trucks only use the general lanes.
+        pool = self.al_khumra_resources if al_khumra else self.resources
+        if key not in pool:
+            kind = "reserved Al-Khumra" if al_khumra else "general"
+            raise RuntimeError(f"Gate {gate} has no {kind} lanes configured for {operation}.")
         requested_at = self.env.now
-        resource = self.resources[key]
+        resource = pool[key]
         with resource.request() as request:
             yield request
             service_start = self.env.now
@@ -1809,6 +1927,7 @@ class GateManager:
             "cargo": cargo, "service_sec": service_sec,
             "requested_min": requested_at, "start_min": service_start,
             "finish_min": finished_at, "wait_min": wait_min,
+            "lane_group": AL_KHUMRA_LANE_GROUP if al_khumra else GENERAL_LANE_GROUP,
         })
 
 
@@ -1945,7 +2064,9 @@ def simulate_truck(
 
             terminal,
 
-            cargo
+            cargo,
+
+            al_khumra=bool(truck.get("al_khumra_entry", False)),
         )
     )
 
@@ -2184,7 +2305,9 @@ def simulate_truck(
 
             terminal,
 
-            cargo
+            cargo,
+
+            al_khumra=bool(truck.get("al_khumra_exit", False)),
         )
     )
 
@@ -2284,7 +2407,7 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
     activities = pd.DataFrame(gate_manager.activities)
     snapshots = pd.DataFrame(gate_manager.queue_snapshots)
 
-    if snapshots.empty:
+    if snapshots.empty and not getattr(gate_manager, "al_khumra_queue_snapshots", []):
         return snapshots
 
     trucks = trucks_df.copy() if isinstance(trucks_df, pd.DataFrame) else pd.DataFrame()
@@ -2307,44 +2430,77 @@ def build_gate_queue_stock_dataframe(gate_manager, trucks_df=None, graph=None):
         """Number of values <= each time (values need not be sorted)."""
         return np.searchsorted(np.sort(np.asarray(values, dtype=float)), times, side="right")
 
-    frames = []
-    for (gate, operation), snap in snapshots.groupby(["gate", "operation"], sort=False):
-        snap = snap.copy()
-        t = snap["time_min"].to_numpy(dtype=float)
-        g = (
-            activities[(activities["gate"] == gate) & (activities["operation"] == operation)]
-            if not activities.empty
-            else pd.DataFrame(columns=["requested_min", "start_min", "finish_min"])
-        )
-        requested = count_at(g["requested_min"], t)
-        finished = count_at(g["finish_min"], t)
-        # Only trucks whose gate service has started; waiting trucks are
-        # already counted in queue_waiting. A finished truck has started,
-        # so started-by-t minus finished-by-t is the number in service.
-        in_service = count_at(g["start_min"], t) - finished
-
-        if operation == "EXIT" and gate in exit_queue_lookup:
-            qg = exit_queue_lookup[gate]
-            # Count trucks that should already have reached the gate under
-            # free-flow conditions but have not yet completed the gate.
-            queue_stock = (
-                count_at(qg["_exit_queue_eligible_min"], t)
-                - count_at(qg["sim_finish_min"], t)
+    def stock_table(snapshots, activities, exit_queue_lookup):
+        frames = []
+        for (gate, operation), snap in snapshots.groupby(["gate", "operation"], sort=False):
+            snap = snap.copy()
+            t = snap["time_min"].to_numpy(dtype=float)
+            g = (
+                activities[(activities["gate"] == gate) & (activities["operation"] == operation)]
+                if not activities.empty
+                else pd.DataFrame(columns=["requested_min", "start_min", "finish_min"])
             )
-            queue_waiting = np.maximum(0, queue_stock - in_service)
-        else:
-            queue_waiting = snap["queue"].to_numpy(dtype=int)
-            queue_stock = queue_waiting + in_service
+            requested = count_at(g["requested_min"], t)
+            finished = count_at(g["finish_min"], t)
+            # Only trucks whose gate service has started; waiting trucks are
+            # already counted in queue_waiting. A finished truck has started,
+            # so started-by-t minus finished-by-t is the number in service.
+            in_service = count_at(g["start_min"], t) - finished
 
-        snap["completed"] = finished
-        snap["requested"] = requested
-        snap["queue_waiting"] = queue_waiting
-        snap["in_service"] = in_service
-        snap["queue_stock"] = queue_stock
-        frames.append(snap)
+            if operation == "EXIT" and gate in exit_queue_lookup:
+                qg = exit_queue_lookup[gate]
+                # Count trucks that should already have reached the gate under
+                # free-flow conditions but have not yet completed the gate.
+                queue_stock = (
+                    count_at(qg["_exit_queue_eligible_min"], t)
+                    - count_at(qg["sim_finish_min"], t)
+                )
+                queue_waiting = np.maximum(0, queue_stock - in_service)
+            else:
+                queue_waiting = snap["queue"].to_numpy(dtype=int)
+                queue_stock = queue_waiting + in_service
 
-    # Keep the original snapshot order.
-    return pd.concat(frames).sort_index().reset_index(drop=True)
+            snap["completed"] = finished
+            snap["requested"] = requested
+            snap["queue_waiting"] = queue_waiting
+            snap["in_service"] = in_service
+            snap["queue_stock"] = queue_stock
+            frames.append(snap)
+        # Keep the original snapshot order.
+        return pd.concat(frames).sort_index().reset_index(drop=True)
+
+    if "lane_group" in activities.columns:
+        is_ak = activities["lane_group"] == AL_KHUMRA_LANE_GROUP
+        general_activities, ak_activities = activities[~is_ak], activities[is_ak]
+    else:
+        general_activities, ak_activities = activities, activities.iloc[0:0]
+
+    general = stock_table(snapshots, general_activities, exit_queue_lookup) if not snapshots.empty else snapshots
+    ak_snapshots = pd.DataFrame(getattr(gate_manager, "al_khumra_queue_snapshots", []))
+    if ak_snapshots.empty:
+        return general
+
+    # Lanes reserved for Al-Khumra: same measure on their own lanes, then
+    # added to the gate total (one row per gate, operation and snapshot).
+    ak = stock_table(ak_snapshots, ak_activities, {})
+    keys = ["time_min", "hour", "gate", "operation"]
+    summed = ["queue", "busy", "capacity_lanes", "completed", "requested",
+              "queue_waiting", "in_service", "queue_stock"]
+    ak_part = ak[keys + summed].rename(columns={c: f"al_khumra_{c}" for c in summed})
+    total = general.merge(ak_part, on=keys, how="outer", sort=False) if not general.empty else ak_part.copy()
+    for c in summed:
+        ak_col = f"al_khumra_{c}"
+        total[ak_col] = total[ak_col].fillna(0).astype(int)
+        total[c] = (total[c].fillna(0) if c in total else 0) + total[ak_col]
+        total[c] = total[c].astype(int)
+    order = {g: i for i, g in enumerate(GATE_LANES)}
+    total = total.sort_values(
+        ["time_min", "gate", "operation"],
+        key=lambda col: col.map(order) if col.name == "gate" else col,
+        kind="stable",
+    ).reset_index(drop=True)
+    total = total.drop(columns=[f"al_khumra_{c}" for c in ("queue", "busy", "completed", "requested", "in_service")])
+    return total
 
 
 def build_marshalling_queue_dataframe(appointment_df):
@@ -2886,6 +3042,20 @@ def validate_configuration():
             "ARRIVAL_TIME_RANDOMIZATION must be between 0 and 1."
         )
 
+    for gate, cfg in AL_KHUMRA_LANES.items():
+        if gate not in GATE_LANES:
+            raise ValueError(f"Unknown gate in AL_KHUMRA_LANES: {gate}")
+        for direction in ("entry", "exit"):
+            reserved = al_khumra_reserved_lanes(gate, direction)
+            total = int(GATE_LANES[gate].get(direction, 0))
+            if reserved < 0:
+                raise ValueError(f"Reserved Al-Khumra {direction} lanes at {gate} must be >= 0.")
+            if reserved > total:
+                raise ValueError(
+                    f"{gate} has {reserved} {direction} lanes reserved for Al-Khumra but only "
+                    f"{total} {direction} lanes in total."
+                )
+
     for (terminal, cargo), options in ENTRY_ACCESS_RULES.items():
         if terminal not in CARGO_SHARES:
             raise ValueError(f"Unknown terminal in ENTRY_ACCESS_RULES: {terminal}")
@@ -2901,6 +3071,11 @@ def validate_configuration():
                 raise ValueError(f"ENTRY_ACCESS_RULES {terminal} {cargo} has negative share for {gate}.")
             if share > 0 and int(GATE_LANES.get(gate, {}).get("entry", 0)) <= 0:
                 raise ValueError(f"ENTRY_ACCESS_RULES {terminal} {cargo} assigns flow to {gate}, but {gate} has 0 entry lanes configured.")
+            if share > 0 and general_lanes(gate, "entry") <= 0:
+                raise ValueError(
+                    f"ENTRY_ACCESS_RULES {terminal} {cargo} assigns flow to {gate}, but all of {gate}'s "
+                    f"entry lanes are reserved for Al-Khumra (AL_KHUMRA_LANES)."
+                )
 
     for rule_name, rules in [
         ("ENTRY_GATE_RULES", ENTRY_GATE_RULES),
@@ -2932,6 +3107,16 @@ def validate_configuration():
                         f"EXIT_GATE_RULES {flow[0]} {flow[1]} assigns flow to {gate}, "
                         f"but {gate} has 0 exit lanes configured."
                     )
+                if (
+                    rule_name == "EXIT_GATE_RULES"
+                    and share > 0
+                    and general_lanes(gate, "exit") <= 0
+                ):
+                    raise ValueError(
+                        f"EXIT_GATE_RULES {flow[0]} {flow[1]} assigns flow to {gate}, but all of "
+                        f"{gate}'s exit lanes are reserved for Al-Khumra (AL_KHUMRA_LANES)."
+                    )
+
 
     for terminal, cfg in AL_KHUMRA_FLOWS.items():
         if terminal not in TERMINAL_SHARES:
@@ -2939,6 +3124,9 @@ def validate_configuration():
         mode = str(cfg.get("mode", "share"))
         if mode not in AL_KHUMRA_MODES:
             raise ValueError(f"Al-Khumra {terminal}: mode must be one of {AL_KHUMRA_MODES}; got {mode!r}.")
+        empty_share = al_khumra_empty_share(cfg)
+        if empty_share is not None and not 0 <= empty_share <= 1:
+            raise ValueError(f"Al-Khumra {terminal}: empty share must be between 0 and 1; got {empty_share}.")
         for direction in ("entry", "exit"):
             value = al_khumra_value(cfg, direction)
             if value < 0:
@@ -2955,6 +3143,11 @@ def validate_configuration():
                 if int(GATE_LANES[gate].get(lane_key, 0)) <= 0:
                     raise ValueError(
                         f"Al-Khumra {terminal}: {key} {gate} has 0 {lane_key} lanes configured."
+                    )
+                if al_khumra_reserved_lanes(gate, lane_key) <= 0:
+                    raise ValueError(
+                        f"Al-Khumra {terminal}: {key} {gate} has no {lane_key} lanes reserved for "
+                        f"Al-Khumra traffic. Reserve at least one {gate} {lane_key} lane (AL_KHUMRA_LANES)."
                     )
 
     for gate, cfg in GATE_LANES.items():
@@ -3433,6 +3626,7 @@ def run_simulation(
     cargo_shares=None,
     save_outputs=True,
     al_khumra_flows=None,
+    al_khumra_lanes=None,
 ):
     global TRUCK_MOVEMENTS_PER_DAY, INTERNAL_MOVEMENTS_PER_DAY, ROUTE_RANDOMIZATION, RANDOM_SEED
     global ENTRY_GATE_RULES, EXIT_GATE_RULES, ENTRY_ACCESS_RULES
@@ -3441,7 +3635,7 @@ def run_simulation(
     global APPOINTMENT_MANAGEMENT_ENABLED, MAX_PORT_ENTRIES_PER_HOUR, ROUTE_OVERRIDES
     global TERMINAL_SHARES, CARGO_SHARES
     global LOGISTICS_DESTINATION_DAILY
-    global AL_KHUMRA_FLOWS
+    global AL_KHUMRA_FLOWS, AL_KHUMRA_LANES
 
     original = (
         TRUCK_MOVEMENTS_PER_DAY,
@@ -3466,6 +3660,7 @@ def run_simulation(
         dict(TERMINAL_SHARES),
         {k:dict(v) for k,v in CARGO_SHARES.items()},
         {k:dict(v) for k,v in AL_KHUMRA_FLOWS.items()},
+        {k:dict(v) for k,v in AL_KHUMRA_LANES.items()},
     )
 
     if trucks_per_day is not None:
@@ -3518,6 +3713,8 @@ def run_simulation(
         CARGO_SHARES = {str(k): {str(c): float(v) for c, v in shares.items()} for k, shares in cargo_shares.items()}
     if al_khumra_flows is not None:
         AL_KHUMRA_FLOWS = {str(k): dict(v) for k, v in al_khumra_flows.items()}
+    if al_khumra_lanes is not None:
+        AL_KHUMRA_LANES = {str(k): dict(v) for k, v in al_khumra_lanes.items()}
 
     try:
         validate_configuration()
@@ -3636,6 +3833,9 @@ def run_simulation(
                 counts = ak_by_terminal.setdefault(t["terminal"], [0, 0])
                 counts[0] += t["al_khumra_entry"]
                 counts[1] += t["al_khumra_exit"]
+        if AL_KHUMRA_EMPTY_SHORTFALL:
+            print("WARNING Al-Khumra empty share not met (terminal had too few empty trucks today): " + ", ".join(
+                f"{k} {v:+,} trucks" for k, v in AL_KHUMRA_EMPTY_SHORTFALL.items()))
         if ak_by_terminal:
             print("Al-Khumra corridor trucks: " + ", ".join(
                 f"{k} {n_in:,} in via {AL_KHUMRA_FLOWS[k]['entry_gate']} / {n_out:,} out via {AL_KHUMRA_FLOWS[k]['exit_gate']}"
@@ -3721,6 +3921,7 @@ def run_simulation(
             "appointment_profile": appointment_df,
             "marshalling_queue": marshalling_queue_df,
             "graph": graph,
+            "al_khumra_empty_shortfall": dict(AL_KHUMRA_EMPTY_SHORTFALL),
         }
     finally:
         (
@@ -3746,6 +3947,7 @@ def run_simulation(
             TERMINAL_SHARES,
             CARGO_SHARES,
             AL_KHUMRA_FLOWS,
+            AL_KHUMRA_LANES,
         ) = original
 
 

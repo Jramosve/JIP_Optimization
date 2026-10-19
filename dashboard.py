@@ -208,15 +208,41 @@ def al_khumra_df(flows):
         mode=str(cfg.get("mode","share")); scale=100.0 if mode=="share" else 1.0
         rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],
                      "Entry value":model.al_khumra_value(cfg,"entry")*scale,"Entry gate":cfg.get("entry_gate","G9"),
-                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8")})
+                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8"),
+                     "Empty share (%)":None if model.al_khumra_empty_share(cfg) is None else model.al_khumra_empty_share(cfg)*100.0})
     return pd.DataFrame(rows)
 
-def df_to_al_khumra(df, terminal_trucks, gate_lanes):
+def al_khumra_lanes_df(reserved, gate_lanes):
+    rows=[]
+    for gate in GATES:
+        rows.append({"Gate":gate,
+                     "IN lanes":int(gate_lanes.get(gate,{}).get("entry",0)),"IN reserved for Al-Khumra":model.al_khumra_reserved_lanes(gate,"entry",reserved),
+                     "OUT lanes":int(gate_lanes.get(gate,{}).get("exit",0)),"OUT reserved for Al-Khumra":model.al_khumra_reserved_lanes(gate,"exit",reserved)})
+    return pd.DataFrame(rows)
+
+def df_to_al_khumra_lanes(df, gate_lanes):
+    reserved={}; errors=[]
+    for _,r in df.iterrows():
+        gate=str(r["Gate"]); reserved[gate]={}
+        for direction,label in [("entry","IN"),("exit","OUT")]:
+            value=int(r[f"{label} reserved for Al-Khumra"] or 0); total=int(gate_lanes.get(gate,{}).get(direction,0))
+            if value<0: errors.append(f"{gate} {label}: reserved Al-Khumra lanes cannot be negative."); value=0
+            if value>total: errors.append(f"{gate} {label}: {value} lanes reserved for Al-Khumra but the gate only has {total} {label} lanes.")
+            reserved[gate][direction]=value
+    return reserved, errors
+
+def df_to_al_khumra(df, terminal_trucks, gate_lanes, cargo_shares=None, reserved_lanes=None):
     """Editor table -> AL_KHUMRA_FLOWS, with the same checks as main.py."""
     flows={}; errors=[]; summary=[]
     for _,r in df.iterrows():
         terminal=str(r["Terminal"]); mode=AK_LABEL_TO_MODE.get(str(r["Input mode"]),"share")
         cfg={"mode":mode,"entry_gate":str(r["Entry gate"]),"exit_gate":str(r["Exit gate"])}
+        raw_empty=r.get("Empty share (%)")
+        if raw_empty is None or pd.isna(raw_empty):
+            cfg["empty_share"]=None
+        else:
+            if not 0<=float(raw_empty)<=100: errors.append(f"Al-Khumra {terminal}: empty share must be between 0% and 100%.")
+            cfg["empty_share"]=min(max(float(raw_empty),0.0),100.0)/100.0
         n_terminal=int(terminal_trucks.get(terminal,0)); n={}
         for direction,label,lanes_label in [("entry","Entry","IN"),("exit","Exit","OUT")]:
             raw=float(r[f"{label} value"] or 0.0)
@@ -233,10 +259,31 @@ def df_to_al_khumra(df, terminal_trucks, gate_lanes):
             gate=cfg[f"{direction}_gate"]
             if value>0 and int(gate_lanes.get(gate,{}).get(direction,0))<=0:
                 errors.append(f"Al-Khumra {terminal}: {gate} has 0 {direction} lanes. Add {gate} {lanes_label} lanes (Advanced mode) or choose another gate.")
+            elif value>0 and reserved_lanes is not None and model.al_khumra_reserved_lanes(gate,direction,reserved_lanes)<=0:
+                errors.append(f"Al-Khumra {terminal}: {gate} has no {lanes_label} lanes reserved for Al-Khumra. Reserve at least one {gate} {lanes_label} lane in the table below or choose another gate.")
         flows[terminal]=cfg
+        n_ak=max(n["entry"],n["exit"])  # nested selections: the larger one contains the other
+        terminal_empty_share=float((cargo_shares or {}).get(terminal,{}).get("EMPTY",0.0))
+        if cfg["empty_share"] is not None:
+            ak_empty=model.al_khumra_empty_count(n_ak,cfg["empty_share"])
+            expected_empty=n_terminal*terminal_empty_share
+            if cargo_shares is not None and ak_empty>expected_empty:
+                errors.append(f"Al-Khumra {terminal}: {ak_empty:,} empty trucks/day needed ({cfg['empty_share']:.0%} of {n_ak:,}), "
+                              f"but {terminal} only has about {expected_empty:,.0f} empty trucks/day ({terminal_empty_share:.0%} empty). "
+                              f"Lower the Al-Khumra volume or its empty share.")
+            ak_full=n_ak-ak_empty
+            if cargo_shares is not None and ak_full>n_terminal-expected_empty:
+                errors.append(f"Al-Khumra {terminal}: {ak_full:,} full trucks/day needed, but {terminal} only has about {n_terminal-expected_empty:,.0f} full trucks/day.")
+            others=n_terminal-n_ak
+            other_empty=f"{max(expected_empty-ak_empty,0)/others:.0%}" if others>0 and cargo_shares is not None else "—"
+            ak_empty_txt=f"{ak_empty:,} ({cfg['empty_share']:.0%})"
+        else:
+            other_empty=f"{terminal_empty_share:.0%}" if cargo_shares is not None else "—"
+            ak_empty_txt=f"as terminal ({terminal_empty_share:.0%})" if n_ak else "—"
         summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,
                         "Enter from Al-Khumra":n["entry"],"Leave to Al-Khumra":n["exit"],
                         "Round trip (both)":min(n["entry"],n["exit"]),
+                        "Al-Khumra empty":ak_empty_txt,"Other traffic empty":other_empty,
                         "Al-Khumra gates":(f"{cfg['entry_gate'] if n['entry'] else '—'} in / {cfg['exit_gate'] if n['exit'] else '—'} out") if (n["entry"] or n["exit"]) else "—"})
     return flows, errors, pd.DataFrame(summary)
 
@@ -809,15 +856,26 @@ st.subheader("Al-Khumra logistics corridor")
 st.caption("Trucks travelling directly between the Al-Khumra corridor and the port. They are part of the daily demand, not additional trucks: "
            "for each terminal, the Al-Khumra trucks use the gates defined here and the remaining trucks follow the general gate allocation above. "
            "Define, for each terminal, how many of its daily trucks ENTER the port from Al-Khumra and how many LEAVE towards Al-Khumra, either as a share of the terminal's trucks or as trucks/day. "
-           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). Cargo mix and appointment cap apply as for any other truck.")
+           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). "
+           "Optionally set the share of Al-Khumra trucks that are empty: they are picked among the terminal's existing empty and full trucks, so the terminal's overall Full/Empty split is unchanged and the rest of its traffic becomes fuller. The appointment cap applies as for any other truck.")
 ak_editor=st.data_editor(al_khumra_df(model.AL_KHUMRA_FLOWS),width="stretch",num_rows="fixed",hide_index=True,disabled=["Terminal"],
     column_config={"Input mode":st.column_config.SelectboxColumn("Input mode",options=list(AK_MODE_LABELS.values()),required=True),
                    "Entry value":st.column_config.NumberColumn("Entry value",min_value=0.0,step=1.0,help="Trucks entering the port from Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Empty share (%)":st.column_config.NumberColumn("Empty share (%)",min_value=0.0,max_value=100.0,step=5.0,help="Share of this terminal's Al-Khumra trucks that are empty. Leave blank to pick them regardless of cargo (same mix as the terminal). The terminal's overall Full/Empty split does not change: the rest of its traffic becomes correspondingly fuller."),
                    "Exit value":st.column_config.NumberColumn("Exit value",min_value=0.0,step=1.0,help="Trucks leaving the port towards Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
                    "Entry gate":st.column_config.SelectboxColumn("Entry gate",options=GATES,required=True),
                    "Exit gate":st.column_config.SelectboxColumn("Exit gate",options=GATES,required=True)},key="al_khumra_editor")
+st.markdown("**Lanes reserved for Al-Khumra**")
+st.caption("Lanes reserved at each gate are exclusive: only Al-Khumra trucks use them, and Al-Khumra trucks only use them. "
+           "They are part of the gate's lanes (e.g. G9 with 4 OUT lanes and 1 reserved = 1 Al-Khumra lane + 3 general lanes). "
+           "Every gate used by an Al-Khumra flow above needs at least one reserved lane in that direction. Total gate lanes are set in the sidebar (Advanced mode).")
+akl_editor=st.data_editor(al_khumra_lanes_df(model.AL_KHUMRA_LANES,gate_lanes),width="stretch",num_rows="fixed",hide_index=True,
+    disabled=["Gate","IN lanes","OUT lanes"],
+    column_config={"IN reserved for Al-Khumra":st.column_config.NumberColumn(min_value=0,max_value=20,step=1),
+                   "OUT reserved for Al-Khumra":st.column_config.NumberColumn(min_value=0,max_value=20,step=1)},key="al_khumra_lanes_editor")
+al_khumra_lanes,akl_errors=df_to_al_khumra_lanes(akl_editor,gate_lanes); flow_errors+=akl_errors
 terminal_trucks_day=model.allocate_integer_counts(int(trucks_per_day),terminal_shares) if not any("Terminal shares" in e for e in flow_errors) else {}
-al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes); flow_errors+=ak_errors
+al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes,cargo_shares,al_khumra_lanes); flow_errors+=ak_errors
 ak_in=int(ak_summary["Enter from Al-Khumra"].sum()); ak_out=int(ak_summary["Leave to Al-Khumra"].sum())
 st.dataframe(ak_summary,width="stretch",hide_index=True)
 if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_in:,} of {int(trucks_per_day):,} trucks/day enter from Al-Khumra and {ak_out:,} leave towards it; all other entries and exits follow the general gate allocation.")
@@ -859,6 +917,8 @@ for direction,rules,lane_key in [("Entry",entry_rules,"entry"),("Exit",exit_rule
         for gate,share in options:
             if share>0 and int(gate_lanes.get(gate,{}).get(lane_key,0))<=0:
                 flow_errors.append(f"{direction} allocation {terminal} {cargo}: {share*100:.0f}% is sent to {gate}, but {gate} has 0 {lane_key} lanes. Change the allocation or add {gate} {'IN' if lane_key=='entry' else 'OUT'} lanes (Advanced mode).")
+            elif share>0 and model.general_lanes(gate,lane_key,gate_lanes,al_khumra_lanes)<=0:
+                flow_errors.append(f"{direction} allocation {terminal} {cargo}: {share*100:.0f}% is sent to {gate}, but all of {gate}'s {'IN' if lane_key=='entry' else 'OUT'} lanes are reserved for Al-Khumra. Reserve fewer lanes or change the allocation.")
 
 if flow_errors:
     st.error("Please correct the following inputs before running:\n\n" + "\n".join(flow_errors))
@@ -871,7 +931,8 @@ scenario_signature=repr((int(trucks_per_day),arrival_time_randomization_pct,rout
     sorted(gate_times.items()),sorted(terminal_shares.items()),sorted((k,sorted(v.items())) for k,v in cargo_shares.items()),
     float(average_speed),sorted((k,sorted(v.items())) for k,v in junctions.items()),
     sorted((k,sorted(v.items())) for k,v in terminal_process.items()),sorted(route_overrides.items()),
-    sorted((k,sorted(v.items())) for k,v in al_khumra_flows.items())))
+    sorted((k,sorted(v.items())) for k,v in al_khumra_flows.items()),
+    sorted((k,sorted(v.items())) for k,v in al_khumra_lanes.items())))
 
 if "result" not in st.session_state: st.session_state.result=None
 if "result_signature" not in st.session_state: st.session_state.result_signature=None
@@ -889,7 +950,7 @@ if st.button("Run simulation",type="primary",disabled=not run_ok):
             capacity_per_lane_vph=capacity_per_lane,junctions=junctions,
             appointment_management_enabled=management_enabled,max_entries_per_hour=int(max_entries),
             route_overrides=route_overrides,logistics_destination_daily=None,terminal_shares=terminal_shares,cargo_shares=cargo_shares,save_outputs=False,
-            al_khumra_flows=al_khumra_flows)
+            al_khumra_flows=al_khumra_flows,al_khumra_lanes=al_khumra_lanes)
         if compare_base:
             st.session_state.base_result=model.run_simulation(
                 trucks_per_day=10500,route_randomization=0.0,arrival_time_variability=0.0,seed=int(seed),
@@ -1053,6 +1114,7 @@ if st.button("Run Gate Monte Carlo",disabled=not run_ok):
             route_randomization=route_randomization_pct/100,
             graph=graph,
             al_khumra_flows=al_khumra_flows,
+            al_khumra_lanes=al_khumra_lanes,
             progress_callback=lambda done,total: progress.progress(done/total,text=f"Running gate-congestion scenarios... {done:,}/{total:,}"),
         )
     st.session_state.mc_signature=scenario_signature
@@ -1063,6 +1125,10 @@ if mc:
     m=mc.get("metrics", {})
     results=mc.get("results", pd.DataFrame()).copy()
     cfg_mc=mc.get("configuration", {})
+    if "al_khumra_empty_shortfall" in results.columns and (results["al_khumra_empty_shortfall"]>0).any():
+        sf=results["al_khumra_empty_shortfall"]
+        st.warning(f"Al-Khumra empty share not fully met in {(sf>0).mean():.0%} of scenarios (up to {int(sf.max()):,} trucks taken with the other cargo): "
+                   "the requested Al-Khumra empties are close to all the terminal's empty trucks, and cargo is drawn at random in each scenario.")
     percentile_labels=list(monte_carlo.PERCENTILES)
     comparable=st.session_state.get("mc_signature")==st.session_state.result_signature
     if not comparable:
@@ -1080,7 +1146,15 @@ if mc:
             run_values[f"peak_queue_{g}_{op}"]=float(q.max()) if len(q) else 0.0
             run_values[f"avg_wait_{g}_{op}"]=float(w.mean()) if len(w) else 0.0
             run_values[f"peak_wait_{g}_{op}"]=float(w.max()) if len(w) else 0.0
-    run_values["peak_queue_all"]=max(v for k,v in run_values.items() if k.startswith("peak_queue_"))
+            # Lanes reserved for Al-Khumra (only when the run had them).
+            if "al_khumra_queue_stock" in qs_day.columns and "lane_group" in gates.columns:
+                qa=qs_day[(qs_day.gate==g)&(qs_day.operation==op)]
+                if len(qa) and qa.al_khumra_capacity_lanes.max()>0:
+                    wa=gates[(gates.gate==g)&(gates.operation==op)&(gates.lane_group==model.AL_KHUMRA_LANE_GROUP)].wait_min
+                    run_values[f"peak_queue_{g}_{op}_al_khumra"]=float(qa.al_khumra_queue_stock.max())
+                    run_values[f"avg_wait_{g}_{op}_al_khumra"]=float(wa.mean()) if len(wa) else 0.0
+                    run_values[f"peak_wait_{g}_{op}_al_khumra"]=float(wa.max()) if len(wa) else 0.0
+    run_values["peak_queue_all"]=max(v for k,v in run_values.items() if k.startswith("peak_queue_") and not k.endswith("_al_khumra"))
     run_values["avg_wait_all"]=float(gates.wait_min.mean()) if not gates.empty else 0.0
     run_values["peak_wait_all"]=float(gates.wait_min.max()) if not gates.empty else 0.0
     if "scheduled_arrival_min" in trucks.columns:
@@ -1120,6 +1194,16 @@ if mc:
                 summary_rows.append({"Gate":f"{g} {op}","Lanes":lanes,"Metric":metric_name,
                                      **{p:float(vals.get(p,0.0)) for p in percentile_labels},
                                      "Simulation run":run_values.get(col,0.0)})
+            # Lanes reserved for Al-Khumra at this gate: their own queue.
+            ak_lanes=int(mc.get("gate_capacities_vph",{}).get(f"{g} {op}",{}).get("al_khumra_lanes",0))
+            if ak_lanes>0:
+                for metric_key,metric_name in [("peak_queue","Peak queue (trucks)"),("peak_wait","Peak queue time (min)"),("avg_wait","Avg queue time (min)")]:
+                    col=f"{metric_key}_{g}_{op}_al_khumra"
+                    vals=m.get(col,{})
+                    dist_options[f"{g} {op} Al-Khumra lanes — {metric_name}"]=col
+                    summary_rows.append({"Gate":f"{g} {op} (Al-Khumra lanes)","Lanes":ak_lanes,"Metric":metric_name,
+                                         **{p:float(vals.get(p,0.0)) for p in percentile_labels},
+                                         "Simulation run":run_values.get(col,0.0)})
     st.dataframe(pd.DataFrame(summary_rows),width="stretch",hide_index=True,
                  column_config={c:st.column_config.NumberColumn(format="%.1f") for c in percentile_labels+["Simulation run"]})
     st.caption("Queue = trucks waiting plus in service at the gate (same definition as the gate queue profile above). The simulation run is a single realisation and is expected to fall inside the P10–P90 band most of the time.")
@@ -1192,7 +1276,8 @@ if st.button("Run ELM cap comparison",disabled=not run_ok or not (sweep_caps or 
                 entry_access_rules=entry_rules,exit_gate_rules=exit_rules,gate_lanes=gate_lanes,gate_times_sec=gate_times,
                 terminal_shares=terminal_shares,cargo_shares=cargo_shares,average_speed_kmh=average_speed,
                 junctions=junctions,terminal_process_min=terminal_process,route_overrides=route_overrides,
-                route_randomization=route_randomization_pct/100,graph=graph,al_khumra_flows=al_khumra_flows)
+                route_randomization=route_randomization_pct/100,graph=graph,al_khumra_flows=al_khumra_flows,
+                al_khumra_lanes=al_khumra_lanes)
         mt=res["metrics"]
         def q(key,p): return float(mt.get(key,{}).get(p,0.0))
         rows.append({
@@ -1275,6 +1360,11 @@ gate_summary=gates.groupby(["gate","operation"]).size().unstack(fill_value=0).re
 
 if "origin" in trucks.columns and (trucks["origin"]==model.AL_KHUMRA_ORIGIN).any():
     st.subheader("Gate flows by origin — Al-Khumra corridor vs other traffic")
+    short=result.get("al_khumra_empty_shortfall") or {}
+    if short:
+        st.warning("Al-Khumra empty share not fully met in this run: on this simulated day "
+                   + ", ".join(f"{t} had {abs(v):,} too few {'empty' if v>0 else 'full'} trucks" for t,v in short.items())
+                   + ", so those Al-Khumra trucks were taken with the other cargo. Cargo is drawn at random, so this happens when the requested empties are close to all the terminal's empties.")
     ak_cols=[c for c in ["al_khumra_entry","al_khumra_exit"] if c in trucks.columns]
     by_origin=gates.merge(trucks[["truck_id","origin","terminal",*ak_cols]],on="truck_id",how="left")
     if len(ak_cols)==2:
@@ -1290,10 +1380,29 @@ if "origin" in trucks.columns and (trucks["origin"]==model.AL_KHUMRA_ORIGIN).any
         per_terminal=trucks.groupby("terminal").agg(**{"Trucks":("truck_id","size"),"Enter from Al-Khumra":("al_khumra_entry","sum"),
                                                      "Leave to Al-Khumra":("al_khumra_exit","sum")})
         per_terminal["Round trip (both)"]=trucks[trucks.al_khumra_entry & trucks.al_khumra_exit].groupby("terminal").size().reindex(per_terminal.index,fill_value=0)
+        ak_any=trucks[trucks.al_khumra_entry | trucks.al_khumra_exit]
+        per_terminal["Al-Khumra empty share"]=(ak_any.cargo=="EMPTY").groupby(ak_any.terminal).mean().reindex(per_terminal.index).map(lambda v:"—" if pd.isna(v) else f"{v:.0%}")
+        other=trucks[~(trucks.al_khumra_entry | trucks.al_khumra_exit)]
+        per_terminal["Other traffic empty share"]=(other.cargo=="EMPTY").groupby(other.terminal).mean().reindex(per_terminal.index).map(lambda v:"—" if pd.isna(v) else f"{v:.0%}")
         st.dataframe(per_terminal,width="stretch")
     else:
         st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")
-    st.caption("Al-Khumra and other trucks share the same gate lanes and FIFO queue; gate queue stock is therefore reported per gate, not split by origin. Queue time by origin is the average wait before gate processing.")
+    if "al_khumra_capacity_lanes" in queue_stock.columns and (queue_stock.al_khumra_capacity_lanes>0).any():
+        st.markdown("**Lanes reserved for Al-Khumra**")
+        rows=[]
+        for (g,op),q in queue_stock[queue_stock.al_khumra_capacity_lanes>0].groupby(["gate","operation"]):
+            ga=gates[(gates.gate==g)&(gates.operation==op)]
+            ak=ga[ga.lane_group==model.AL_KHUMRA_LANE_GROUP]; gen=ga[ga.lane_group!=model.AL_KHUMRA_LANE_GROUP]
+            rows.append({"Gate":g,"Operation":op,
+                         "Al-Khumra lanes":int(q.al_khumra_capacity_lanes.max()),"General lanes":int((q.capacity_lanes-q.al_khumra_capacity_lanes).max()),
+                         "Al-Khumra trucks":len(ak),"Other trucks":len(gen),
+                         "Peak queue Al-Khumra lanes":int(q.al_khumra_queue_stock.max()),"Peak queue general lanes":int((q.queue_stock-q.al_khumra_queue_stock).max()),
+                         "Avg wait Al-Khumra (min)":round(float(ak.wait_min.mean()),2) if len(ak) else 0.0,"Avg wait other (min)":round(float(gen.wait_min.mean()),2) if len(gen) else 0.0,
+                         "Peak wait Al-Khumra (min)":round(float(ak.wait_min.max()),1) if len(ak) else 0.0,"Peak wait other (min)":round(float(gen.wait_min.max()),1) if len(gen) else 0.0})
+        st.dataframe(pd.DataFrame(rows),width="stretch",hide_index=True)
+        st.caption("Reserved lanes are exclusive: Al-Khumra trucks queue only for their lanes and other trucks only for the general lanes. Gate queue stock elsewhere in the dashboard is the total of both.")
+    else:
+        st.caption("No lanes are reserved for Al-Khumra in this run.")
 
 st.subheader("Export results")
 ec1,ec2,ec3=st.columns(3)
