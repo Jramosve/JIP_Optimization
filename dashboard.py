@@ -208,15 +208,22 @@ def al_khumra_df(flows):
         mode=str(cfg.get("mode","share")); scale=100.0 if mode=="share" else 1.0
         rows.append({"Terminal":terminal,"Input mode":AK_MODE_LABELS[mode],
                      "Entry value":model.al_khumra_value(cfg,"entry")*scale,"Entry gate":cfg.get("entry_gate","G9"),
-                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8")})
+                     "Exit value":model.al_khumra_value(cfg,"exit")*scale,"Exit gate":cfg.get("exit_gate","G8"),
+                     "Empty share (%)":None if model.al_khumra_empty_share(cfg) is None else model.al_khumra_empty_share(cfg)*100.0})
     return pd.DataFrame(rows)
 
-def df_to_al_khumra(df, terminal_trucks, gate_lanes):
+def df_to_al_khumra(df, terminal_trucks, gate_lanes, cargo_shares=None):
     """Editor table -> AL_KHUMRA_FLOWS, with the same checks as main.py."""
     flows={}; errors=[]; summary=[]
     for _,r in df.iterrows():
         terminal=str(r["Terminal"]); mode=AK_LABEL_TO_MODE.get(str(r["Input mode"]),"share")
         cfg={"mode":mode,"entry_gate":str(r["Entry gate"]),"exit_gate":str(r["Exit gate"])}
+        raw_empty=r.get("Empty share (%)")
+        if raw_empty is None or pd.isna(raw_empty):
+            cfg["empty_share"]=None
+        else:
+            if not 0<=float(raw_empty)<=100: errors.append(f"Al-Khumra {terminal}: empty share must be between 0% and 100%.")
+            cfg["empty_share"]=min(max(float(raw_empty),0.0),100.0)/100.0
         n_terminal=int(terminal_trucks.get(terminal,0)); n={}
         for direction,label,lanes_label in [("entry","Entry","IN"),("exit","Exit","OUT")]:
             raw=float(r[f"{label} value"] or 0.0)
@@ -234,9 +241,28 @@ def df_to_al_khumra(df, terminal_trucks, gate_lanes):
             if value>0 and int(gate_lanes.get(gate,{}).get(direction,0))<=0:
                 errors.append(f"Al-Khumra {terminal}: {gate} has 0 {direction} lanes. Add {gate} {lanes_label} lanes (Advanced mode) or choose another gate.")
         flows[terminal]=cfg
+        n_ak=max(n["entry"],n["exit"])  # nested selections: the larger one contains the other
+        terminal_empty_share=float((cargo_shares or {}).get(terminal,{}).get("EMPTY",0.0))
+        if cfg["empty_share"] is not None:
+            ak_empty=model.al_khumra_empty_count(n_ak,cfg["empty_share"])
+            expected_empty=n_terminal*terminal_empty_share
+            if cargo_shares is not None and ak_empty>expected_empty:
+                errors.append(f"Al-Khumra {terminal}: {ak_empty:,} empty trucks/day needed ({cfg['empty_share']:.0%} of {n_ak:,}), "
+                              f"but {terminal} only has about {expected_empty:,.0f} empty trucks/day ({terminal_empty_share:.0%} empty). "
+                              f"Lower the Al-Khumra volume or its empty share.")
+            ak_full=n_ak-ak_empty
+            if cargo_shares is not None and ak_full>n_terminal-expected_empty:
+                errors.append(f"Al-Khumra {terminal}: {ak_full:,} full trucks/day needed, but {terminal} only has about {n_terminal-expected_empty:,.0f} full trucks/day.")
+            others=n_terminal-n_ak
+            other_empty=f"{max(expected_empty-ak_empty,0)/others:.0%}" if others>0 and cargo_shares is not None else "—"
+            ak_empty_txt=f"{ak_empty:,} ({cfg['empty_share']:.0%})"
+        else:
+            other_empty=f"{terminal_empty_share:.0%}" if cargo_shares is not None else "—"
+            ak_empty_txt=f"as terminal ({terminal_empty_share:.0%})" if n_ak else "—"
         summary.append({"Terminal":terminal,"Terminal trucks/day":n_terminal,
                         "Enter from Al-Khumra":n["entry"],"Leave to Al-Khumra":n["exit"],
                         "Round trip (both)":min(n["entry"],n["exit"]),
+                        "Al-Khumra empty":ak_empty_txt,"Other traffic empty":other_empty,
                         "Al-Khumra gates":(f"{cfg['entry_gate'] if n['entry'] else '—'} in / {cfg['exit_gate'] if n['exit'] else '—'} out") if (n["entry"] or n["exit"]) else "—"})
     return flows, errors, pd.DataFrame(summary)
 
@@ -809,15 +835,17 @@ st.subheader("Al-Khumra logistics corridor")
 st.caption("Trucks travelling directly between the Al-Khumra corridor and the port. They are part of the daily demand, not additional trucks: "
            "for each terminal, the Al-Khumra trucks use the gates defined here and the remaining trucks follow the general gate allocation above. "
            "Define, for each terminal, how many of its daily trucks ENTER the port from Al-Khumra and how many LEAVE towards Al-Khumra, either as a share of the terminal's trucks or as trucks/day. "
-           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). Cargo mix and appointment cap apply as for any other truck.")
+           "The two selections are nested: the trucks entering from Al-Khumra are the first ones to leave towards it (with equal values, every Al-Khumra truck makes the round trip). "
+           "Optionally set the share of Al-Khumra trucks that are empty: they are picked among the terminal's existing empty and full trucks, so the terminal's overall Full/Empty split is unchanged and the rest of its traffic becomes fuller. The appointment cap applies as for any other truck.")
 ak_editor=st.data_editor(al_khumra_df(model.AL_KHUMRA_FLOWS),width="stretch",num_rows="fixed",hide_index=True,disabled=["Terminal"],
     column_config={"Input mode":st.column_config.SelectboxColumn("Input mode",options=list(AK_MODE_LABELS.values()),required=True),
                    "Entry value":st.column_config.NumberColumn("Entry value",min_value=0.0,step=1.0,help="Trucks entering the port from Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
+                   "Empty share (%)":st.column_config.NumberColumn("Empty share (%)",min_value=0.0,max_value=100.0,step=5.0,help="Share of this terminal's Al-Khumra trucks that are empty. Leave blank to pick them regardless of cargo (same mix as the terminal). The terminal's overall Full/Empty split does not change: the rest of its traffic becomes correspondingly fuller."),
                    "Exit value":st.column_config.NumberColumn("Exit value",min_value=0.0,step=1.0,help="Trucks leaving the port towards Al-Khumra: % of the terminal's trucks, or trucks/day, depending on the input mode."),
                    "Entry gate":st.column_config.SelectboxColumn("Entry gate",options=GATES,required=True),
                    "Exit gate":st.column_config.SelectboxColumn("Exit gate",options=GATES,required=True)},key="al_khumra_editor")
 terminal_trucks_day=model.allocate_integer_counts(int(trucks_per_day),terminal_shares) if not any("Terminal shares" in e for e in flow_errors) else {}
-al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes); flow_errors+=ak_errors
+al_khumra_flows,ak_errors,ak_summary=df_to_al_khumra(ak_editor,terminal_trucks_day,gate_lanes,cargo_shares); flow_errors+=ak_errors
 ak_in=int(ak_summary["Enter from Al-Khumra"].sum()); ak_out=int(ak_summary["Leave to Al-Khumra"].sum())
 st.dataframe(ak_summary,width="stretch",hide_index=True)
 if not ak_errors: st.caption(f"Al-Khumra corridor: {ak_in:,} of {int(trucks_per_day):,} trucks/day enter from Al-Khumra and {ak_out:,} leave towards it; all other entries and exits follow the general gate allocation.")
@@ -1290,6 +1318,10 @@ if "origin" in trucks.columns and (trucks["origin"]==model.AL_KHUMRA_ORIGIN).any
         per_terminal=trucks.groupby("terminal").agg(**{"Trucks":("truck_id","size"),"Enter from Al-Khumra":("al_khumra_entry","sum"),
                                                      "Leave to Al-Khumra":("al_khumra_exit","sum")})
         per_terminal["Round trip (both)"]=trucks[trucks.al_khumra_entry & trucks.al_khumra_exit].groupby("terminal").size().reindex(per_terminal.index,fill_value=0)
+        ak_any=trucks[trucks.al_khumra_entry | trucks.al_khumra_exit]
+        per_terminal["Al-Khumra empty share"]=(ak_any.cargo=="EMPTY").groupby(ak_any.terminal).mean().reindex(per_terminal.index).map(lambda v:"—" if pd.isna(v) else f"{v:.0%}")
+        other=trucks[~(trucks.al_khumra_entry | trucks.al_khumra_exit)]
+        per_terminal["Other traffic empty share"]=(other.cargo=="EMPTY").groupby(other.terminal).mean().reindex(per_terminal.index).map(lambda v:"—" if pd.isna(v) else f"{v:.0%}")
         st.dataframe(per_terminal,width="stretch")
     else:
         st.dataframe(trucks.groupby(["terminal","origin"]).size().unstack(fill_value=0).rename(columns={model.AL_KHUMRA_ORIGIN:"Al-Khumra",model.GENERAL_ORIGIN:"Other"}),width="stretch")

@@ -219,3 +219,66 @@ def test_monte_carlo_entry_and_exit_volumes(split_run):
     assert (res["al_khumra_exit_trucks"] == t.al_khumra_exit.sum()).all()
     assert (res["al_khumra_trucks"] == (t.al_khumra_entry | t.al_khumra_exit).sum()).all()
     assert (res["peak_queue_G6_ENTRY"] > 0).all()
+
+
+# ---- Empty share of Al-Khumra trucks --------------------------------------
+
+EMPTY_FLOWS = {
+    **ZERO_FLOWS,
+    "RSGT": {"mode": "share", "entry_value": 0.20, "exit_value": 0.30, "entry_gate": "G6",
+             "exit_gate": "G8", "empty_share": 0.80},
+    "DPW": {"mode": "absolute", "entry_value": 1000, "exit_value": 1000, "entry_gate": "G9",
+            "exit_gate": "G8", "empty_share": 0.0},
+}
+
+
+@pytest.fixture(scope="module")
+def empty_run():
+    return run_main(trucks_per_day=20000, seed=7, arrival_time_variability=0.15,
+                    gate_lanes=LANES_G6, al_khumra_flows=EMPTY_FLOWS)
+
+
+def test_empty_share_of_al_khumra_trucks(empty_run):
+    t = empty_run["trucks"]
+    rsgt, dpw = t[t.terminal == "RSGT"], t[t.terminal == "DPW"]
+    for sub, n, empty in ((rsgt[rsgt.al_khumra_entry], 1600, 1280), (rsgt[rsgt.al_khumra_exit], 2400, 1920)):
+        assert len(sub) == n and (sub.cargo == "EMPTY").sum() == empty
+    assert (dpw[dpw.al_khumra_entry | dpw.al_khumra_exit].cargo == "FULL").all()
+    rsgt_entry, rsgt_exit = set(rsgt.truck_id[rsgt.al_khumra_entry]), set(rsgt.truck_id[rsgt.al_khumra_exit])
+    assert rsgt_entry <= rsgt_exit
+
+
+def test_empty_share_keeps_terminal_mix(empty_run, runs):
+    # Cargo is never changed: every truck keeps the cargo of the base run, so
+    # the terminal Full/Empty mix is unchanged and other traffic gets fuller.
+    t, base = empty_run["trucks"], runs["none"]["trucks"]
+    assert t["cargo"].equals(base["cargo"])
+    rsgt = t[t.terminal == "RSGT"]
+    other = rsgt[~(rsgt.al_khumra_entry | rsgt.al_khumra_exit)]
+    assert (other.cargo == "EMPTY").mean() < (rsgt.cargo == "EMPTY").mean()
+
+
+def test_blank_empty_share_is_unchanged(runs):
+    flows = {t: {**c, "empty_share": None} for t, c in FLOWS.items()}
+    r = run_main(trucks_per_day=20000, seed=7, arrival_time_variability=0.15, gate_lanes=LANES_G6, al_khumra_flows=flows)
+    assert r["trucks"].equals(runs["ak"]["trucks"])
+
+
+def test_too_many_empty_trucks_is_rejected():
+    flows = {**ZERO_FLOWS, "RSGT": {**EMPTY_FLOWS["RSGT"], "exit_value": 0.9, "empty_share": 0.9}}
+    with pytest.raises(ValueError, match="EMPTY trucks/day are needed"):
+        run_main(trucks_per_day=20000, seed=7, gate_lanes=LANES_G6, al_khumra_flows=flows)
+    with pytest.raises(ValueError, match="EMPTY trucks/day are needed"):
+        mcm.run_monte_carlo(model, 5, trucks_per_day=20000, seed=7, gate_lanes=LANES_G6, al_khumra_flows=flows)
+    with pytest.raises(ValueError, match="empty share"):
+        run_main(trucks_per_day=20000, seed=7, gate_lanes=LANES_G6,
+                 al_khumra_flows={**ZERO_FLOWS, "RSGT": {**EMPTY_FLOWS["RSGT"], "empty_share": 1.5}})
+
+
+def test_monte_carlo_empty_share_matches_main(empty_run):
+    res = mcm.run_monte_carlo(model, 30, trucks_per_day=20000, arrival_variability=0.15, seed=7,
+                              gate_lanes=LANES_G6, al_khumra_flows=EMPTY_FLOWS)["results"]
+    t = empty_run["trucks"]
+    ak = t[t.al_khumra_entry | t.al_khumra_exit]
+    assert (res["al_khumra_trucks"] == len(ak)).all()
+    assert (res["al_khumra_empty_trucks"] == (ak.cargo == "EMPTY").sum()).all()

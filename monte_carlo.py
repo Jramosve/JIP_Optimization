@@ -119,6 +119,15 @@ def _ak_value(cfg, direction):
     return float(cfg[key]) if key in cfg else float(cfg.get("value", 0.0))
 
 
+def _ak_empty_share(cfg):
+    """Share of EMPTY trucks among Al-Khumra trucks, or None (any cargo);
+    same rule as main.al_khumra_empty_share."""
+    value = cfg.get("empty_share")
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    return float(value)
+
+
 def _load_graph(model):
     key = id(model)
     if key not in _GRAPH_CACHE:
@@ -448,6 +457,7 @@ def _simulate_batch(cfg, rng, batch):
     # One random ranking per terminal for both directions, so entry and
     # exit selections are nested (as in main.apply_al_khumra_flows).
     al_khumra_trucks = np.zeros(batch)
+    al_khumra_empty_trucks = np.zeros(batch)
     al_khumra_entry_trucks = np.zeros(batch)
     al_khumra_exit_trucks = np.zeros(batch)
     ak = cfg.get("al_khumra")
@@ -456,11 +466,19 @@ def _simulate_batch(cfg, rng, batch):
         for t, flow_cfg in enumerate(ak["per_terminal"]):
             if flow_cfg is None:
                 continue
-            mode, entry_value, exit_value, ak_entry, ak_exit = flow_cfg
+            mode, entry_value, exit_value, ak_entry, ak_exit, empty_share = flow_cfg
             mask = terminal == t
             n_terminal = mask.sum(axis=1)
-            k = np.where(mask, keys, np.inf)
-            sorted_k = np.sort(k, axis=1)
+            # Groups ranked separately: the whole terminal, or its EMPTY and
+            # FULL trucks when an empty share is set (cargo 1 = EMPTY).
+            groups = (
+                [(mask, None)] if empty_share is None
+                else [(mask & (cargo == 1), "EMPTY"), (mask & (cargo == 0), "FULL")]
+            )
+            ranked = []
+            for group_mask, label in groups:
+                k = np.where(group_mask, keys, np.inf)
+                ranked.append((group_mask, label, k, np.sort(k, axis=1)))
             selected = {}
             for direction, value in (("entry", entry_value), ("exit", exit_value)):
                 n = (
@@ -472,13 +490,28 @@ def _simulate_batch(cfg, rng, batch):
                         f"Al-Khumra {direction} flow for {cfg['terminals'][t]} ({int(n.max()):,} trucks/day) "
                         f"exceeds the terminal's daily trucks ({int(n_terminal.min()):,})."
                     )
-                threshold = np.where(
-                    n > 0, sorted_k[np.arange(batch), np.maximum(n - 1, 0)], -np.inf
-                )
-                selected[direction] = mask & (k <= threshold[:, None])
+                n_empty = None if empty_share is None else np.floor(empty_share * n + 0.5).astype(np.int64)
+                chosen = np.zeros_like(mask)
+                for group_mask, label, k, sorted_k in ranked:
+                    need = n if label is None else (n_empty if label == "EMPTY" else n - n_empty)
+                    available = group_mask.sum(axis=1)
+                    if (need > available).any():
+                        s_bad = int(np.argmax(need > available))
+                        raise ValueError(
+                            f"Al-Khumra {cfg['terminals'][t]}: {int(need[s_bad]):,} {label} trucks/day are needed "
+                            f"({empty_share:.0%} empty of {int(n[s_bad]):,}), but the terminal only has "
+                            f"{int(available[s_bad]):,} {label} trucks/day in a scenario. "
+                            f"Lower the Al-Khumra volume or adjust its empty share."
+                        )
+                    threshold = np.where(
+                        need > 0, sorted_k[np.arange(batch), np.maximum(need - 1, 0)], -np.inf
+                    )
+                    chosen |= group_mask & (k <= threshold[:, None])
+                selected[direction] = chosen
             entry_gate[selected["entry"]] = ak_entry
             exit_gate[selected["exit"]] = ak_exit
             al_khumra_trucks += (selected["entry"] | selected["exit"]).sum(axis=1)
+            al_khumra_empty_trucks += ((selected["entry"] | selected["exit"]) & (cargo == 1)).sum(axis=1)
             al_khumra_entry_trucks += selected["entry"].sum(axis=1)
             al_khumra_exit_trucks += selected["exit"].sum(axis=1)
 
@@ -534,6 +567,7 @@ def _simulate_batch(cfg, rng, batch):
         "marshalling_truck_hours": marshalling_wait.sum(axis=1) / 60.0,
         "last_entry_hour": arrival[:, -1] / 60.0,
         "al_khumra_trucks": al_khumra_trucks,
+        "al_khumra_empty_trucks": al_khumra_empty_trucks,
         "al_khumra_entry_trucks": al_khumra_entry_trucks,
         "al_khumra_exit_trucks": al_khumra_exit_trucks,
     }
@@ -743,6 +777,9 @@ def run_monte_carlo(
         mode = str(cfg.get("mode", "share"))
         if mode not in ("share", "absolute"):
             raise ValueError(f"Al-Khumra {terminal}: mode must be 'share' or 'absolute'.")
+        empty_share = _ak_empty_share(cfg)
+        if empty_share is not None and not 0 <= empty_share <= 1:
+            raise ValueError(f"Al-Khumra {terminal}: empty share must be between 0 and 1.")
         for direction in ("entry", "exit"):
             value = _ak_value(cfg, direction)
             if value < 0 or (mode == "share" and value > 1):
@@ -908,6 +945,7 @@ def run_monte_carlo(
                     _ak_value(al_khumra_active[t], "exit"),
                     gate_index_final.get(al_khumra_active[t].get("entry_gate"), -1),
                     gate_index_final.get(al_khumra_active[t].get("exit_gate"), -1),
+                    _ak_empty_share(al_khumra_active[t]),
                 ) if t in al_khumra_active else None
                 for t in terminals
             ],

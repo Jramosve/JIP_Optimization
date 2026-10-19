@@ -384,6 +384,12 @@ EXIT_GATE_RULES = {
 #   entry_value = trucks that ENTER the port from Al-Khumra (use entry_gate)
 #   exit_value  = trucks that LEAVE the port to Al-Khumra (use exit_gate)
 #   A single "value" (older configurations) sets both entry and exit.
+#   empty_share = share of the terminal's Al-Khumra trucks that are EMPTY
+#                 (0-1), or None to pick them regardless of cargo. The trucks
+#                 are chosen among the terminal's existing EMPTY and FULL
+#                 trucks, so the terminal's overall Full/Empty mix is
+#                 unchanged; only its general (non Al-Khumra) traffic becomes
+#                 correspondingly fuller.
 #
 # Entry and exit selections are nested: trucks are ranked once per terminal
 # and the first entry_value / exit_value of that ranking are tagged, so the
@@ -399,10 +405,10 @@ GENERAL_ORIGIN = "GENERAL"
 AL_KHUMRA_MODES = ("share", "absolute")
 
 AL_KHUMRA_FLOWS = {
-    "RSGT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "DPW": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
-    "LOGISTICS": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8"},
+    "RSGT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "DPW": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "MPT": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
+    "LOGISTICS": {"mode": "share", "entry_value": 0.0, "exit_value": 0.0, "entry_gate": "G9", "exit_gate": "G8", "empty_share": None},
 }
 
 
@@ -1404,6 +1410,21 @@ def al_khumra_value(cfg, direction):
     return float(cfg[key]) if key in cfg else float(cfg.get("value", 0.0))
 
 
+def al_khumra_empty_share(cfg):
+    """Share of EMPTY trucks among a terminal's Al-Khumra trucks, or None
+    when they are picked regardless of cargo."""
+    value = cfg.get("empty_share")
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return float(value)
+
+
+def al_khumra_empty_count(n, empty_share):
+    """EMPTY trucks among n Al-Khumra trucks (rounded half-up). Both this and
+    n minus it are non-decreasing in n, which keeps selections nested."""
+    return int(math.floor(float(empty_share) * int(n) + 0.5))
+
+
 def al_khumra_active_flows(flows=None):
     """Terminals with a non-zero Al-Khumra entry or exit flow."""
     flows = AL_KHUMRA_FLOWS if flows is None else flows
@@ -1455,11 +1476,36 @@ def apply_al_khumra_flows(trucks, flows=None, seed=None):
         # to leave towards it.
         order = list(indices)
         random.Random(f"al_khumra:{seed}:{terminal}").shuffle(order)
-        for i in order[:counts["entry"]]:
+        empty_share = al_khumra_empty_share(cfg)
+        if empty_share is None:
+            def pick(n):
+                return order[:n]
+        else:
+            # Same ranking, split by cargo: take the first EMPTY and the
+            # first FULL trucks in the required proportion. Cargo is never
+            # changed, so the terminal's Full/Empty mix stays as configured.
+            by_cargo = {
+                c: [i for i in order if trucks[i]["cargo"] == c]
+                for c in ("EMPTY", "FULL")
+            }
+
+            def pick(n):
+                need = {"EMPTY": al_khumra_empty_count(n, empty_share)}
+                need["FULL"] = n - need["EMPTY"]
+                for cargo, k in need.items():
+                    if k > len(by_cargo[cargo]):
+                        raise ValueError(
+                            f"Al-Khumra {terminal}: {k:,} {cargo} trucks/day are needed "
+                            f"({empty_share:.0%} empty of {n:,}), but {terminal} only has "
+                            f"{len(by_cargo[cargo]):,} {cargo} trucks/day in this scenario. "
+                            f"Lower the Al-Khumra volume or adjust its empty share."
+                        )
+                return by_cargo["EMPTY"][:need["EMPTY"]] + by_cargo["FULL"][:need["FULL"]]
+        for i in pick(counts["entry"]):
             trucks[i]["origin"] = AL_KHUMRA_ORIGIN
             trucks[i]["al_khumra_entry"] = True
             trucks[i]["entry_gate"] = cfg["entry_gate"]
-        for i in order[:counts["exit"]]:
+        for i in pick(counts["exit"]):
             trucks[i]["origin"] = AL_KHUMRA_ORIGIN
             trucks[i]["al_khumra_exit"] = True
             trucks[i]["exit_gate"] = cfg["exit_gate"]
@@ -2939,6 +2985,9 @@ def validate_configuration():
         mode = str(cfg.get("mode", "share"))
         if mode not in AL_KHUMRA_MODES:
             raise ValueError(f"Al-Khumra {terminal}: mode must be one of {AL_KHUMRA_MODES}; got {mode!r}.")
+        empty_share = al_khumra_empty_share(cfg)
+        if empty_share is not None and not 0 <= empty_share <= 1:
+            raise ValueError(f"Al-Khumra {terminal}: empty share must be between 0 and 1; got {empty_share}.")
         for direction in ("entry", "exit"):
             value = al_khumra_value(cfg, direction)
             if value < 0:
